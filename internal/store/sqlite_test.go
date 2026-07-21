@@ -78,3 +78,35 @@ func TestIdempotencyReservationIsDurableAndCompletesConditionally(t *testing.T) 
 		t.Fatalf("completed replay existing=%q reserved=%v error=%v", existing, reserved, err)
 	}
 }
+
+func TestLiquidationIntentIsDurableUntilDeleted(t *testing.T) {
+	database, err := Open(filepath.Join(t.TempDir(), "tradeguardian.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	ctx := context.Background()
+	intent := domain.LiquidationIntent{PositionKey: "NFO:NIFTY26JULFUT|MIS", OrderID: "pending-exit:abc", CreatedAt: time.Now().UTC()}
+	if err := database.PutLiquidationIntent(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	intents, err := database.ListLiquidationIntents(ctx)
+	if err != nil || len(intents) != 1 || intents[0].OrderID != intent.OrderID {
+		t.Fatalf("intents=%#v error=%v", intents, err)
+	}
+	intent.OrderID = "parent-1"
+	if err := database.PutLiquidationIntent(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	intents, err = database.ListLiquidationIntents(ctx)
+	if err != nil || len(intents) != 1 || intents[0].OrderID != "parent-1" {
+		t.Fatalf("updated intents=%#v error=%v", intents, err)
+	}
+	if err := database.DeleteLiquidationIntent(ctx, intent.PositionKey); err != nil {
+		t.Fatal(err)
+	}
+	intents, err = database.ListLiquidationIntents(ctx)
+	if err != nil || len(intents) != 0 {
+		t.Fatalf("deleted intents=%#v error=%v", intents, err)
+	}
+}

@@ -108,7 +108,9 @@ flowchart TD
     P --> Q{"Positions call successful?"}
     Q -- No token/session --> AR["AUTH_REQUIRED; block placements/modifications"]
     Q -- Other failure --> DG["MONITORING_DEGRADED; block placements/modifications"]
-    Q -- Yes --> M["Sum all NFO/BFO net-position m2m in rupees, then round once to paise"]
+    Q -- Yes --> V{"Every included m2m finite<br/>and representable in paise?"}
+    V -- No --> DG
+    V -- Yes --> M["Sum all NFO/BFO net-position m2m in rupees, then round once to paise"]
     M --> C{"MTM <= -₹30,000?"}
     C -- No --> O["Fetch today's orders for pending-risk/reconciliation state"]
     O --> OS{"Orders call successful?"}
@@ -127,6 +129,10 @@ flowchart TD
 ```
 
 The MTM decision does **not** wait for the orders endpoint. A successful positions response at or below the threshold locks immediately even when reading the order book fails. The order-book failure can delay cancellation/reconciliation, but it cannot keep trading active after a known threshold breach.
+
+Kite exposes several in-flight OMS states before an order becomes `OPEN`, and those states can temporarily show zero pending quantity. TradeGuardian treats every status other than `COMPLETE`, `CANCELLED`, and `REJECTED` as live exposure, using the unfilled/uncancelled quantity when Kite has not populated `pending_quantity` yet. This rule is used by cancellation, portfolio coverage, the dashboard, and liquidation reconciliation.
+
+A forced exit response is only a submission acknowledgement, not an execution confirmation. TradeGuardian durably reserves a position-specific liquidation intent in SQLite **before** the broker call, replaces the reservation with the returned parent order ID, recognises autoslice children through their parent relationship, and will not submit a duplicate while that intent is absent from the order book or otherwise uncertain. If a forced exit is still live after its position is already flat, TradeGuardian cancels it to avoid creating a reverse position. Intent records survive restart and are removed only after reconciliation; unresolved `DAY` intents from an earlier IST date are expired after a fresh authenticated orders/positions poll because that order validity cannot remain live on the new day.
 
 If persisting the initial lock fails, the process still locks in memory, starts liquidation, and retries the SQLite lock on later successful polls. A process/host failure during that narrow database-failure window cannot provide the normal restart guarantee; the dashboard and logs report the persistence failure.
 
@@ -218,6 +224,8 @@ At exactly the threshold or below it, TradeGuardian performs this sequence:
 
 The lock survives restarts and broker/network failures. Every placement and modification is rejected while locked. Cancellations and internal/risk-reducing full-position exits remain available. There is no unlock button, API route, browser flag, or general risk bypass.
 
+If an included broker `m2m` is NaN, infinite, or outside the supported paise range, TradeGuardian does not compare a fabricated number with the loss threshold. It retains the last valid displayed MTM, enters `MONITORING_DEGRADED`, and blocks new placements/modifications until a valid fresh poll succeeds.
+
 The next scheduled unlock is 09:15 Asia/Kolkata on the next Monday–Friday that is not listed as an exchange holiday. Unlock occurs only after liquidation is confirmed `COMPLETED`; otherwise the lock remains. After changing to `ACTIVE`, order entry remains fail-closed until a fresh positions/orders poll succeeds. Startup also performs an overdue eligible unlock. The annual holiday configuration must be reviewed and replaced before each calendar year. Startup rejects malformed dates, dates outside the declared year, duplicates, and a date listed as both a holiday and special trading day. If the next day falls outside the configured calendar year, unlock time is left unset (fail-closed). Special sessions remain treated as closed unless explicitly configured as supported trading days.
 
 ## Runtime states shown in the dashboard
@@ -244,6 +252,7 @@ SQLite stores:
 
 - the authoritative `ACTIVE`/`LOCKED` state;
 - lock date, trigger MTM/time, intended unlock, liquidation progress, and last error;
+- durable, position-specific liquidation intent reservations used to prevent duplicate exits across timeouts and restarts;
 - idempotency reservations written before broker submission, followed by the confirmed broker order ID;
 - append-only, redacted decision and broker-operation audit events.
 
@@ -265,6 +274,8 @@ Mutating requests require all of the following:
 - server-side instrument, order, position, status, and idempotency validation.
 
 For HTTPS deployments, authentication-state and CSRF cookies are marked `Secure`. Secrets and tokens are not rendered in HTML, returned by APIs, or written to logs/audit records.
+
+Dashboard, API, and event-stream responses use `Cache-Control: no-store`, so account state is not intentionally retained by browser or proxy caches.
 
 ## VPS deployment model
 
@@ -332,6 +343,8 @@ These are the highest-impact current interpretations. They are written plainly s
 | Maximum planned loss | Calculated for the new basket at expiry from submitted limit prices only | It is not whole-account risk, intraday worst loss, margin requirement, stop-loss exposure, slippage, or charges |
 | Rollback priority | If short closure is uncertain, protective longs are kept and trading degrades | Failure can leave extra long premium exposure, intentionally preferred over leaving naked shorts |
 | MARKET protection | Forced exits use automatic market protection and autoslice | Market protection converts to a protected limit and can remain unfilled/rejected; “square off” is best effort plus reconciliation, not a guarantee |
+| Exit uncertainty | A submitted forced exit is not duplicated until its parent/children are visible and terminal; an orphan live exit is cancelled after the position is flat | The application may remain locked/degraded while the OMS is uncertain, preferring delay over an accidental reverse position |
+| Unknown metadata | Existing F&O positions or pending SELL orders whose contracts cannot be resolved block new option exposure | Expired/stale catalogue gaps can reduce availability, but are never silently ignored during hedge validation |
 | Direct Kite orders | Cannot be pre-blocked; monitor/liquidator still sees them | Direct trading can defeat pre-trade discipline and can race liquidation |
 | Calendar boundary | Missing next-year calendar leaves unlock unset/fail-closed | Annual calendar maintenance is operationally mandatory before year end |
 
@@ -345,6 +358,7 @@ If any row is not your intended policy, change it before connecting a production
 - Kite basket placement is coordinated but not exchange-atomic.
 - A richer modification dialog still uses a basic browser prompt; its server request remains guarded.
 - Instrument search requires the daily authenticated instrument load.
+- Broker order updates are reconciled by REST polling; Kite WebSocket order updates are not yet integrated, so UI and state transitions have polling/API latency.
 - Only the documented basket shapes/invariants are supported; strategy templates and saved baskets are future product choices.
 - The production VPS domain, authentication layer, firewall, service unit, reverse-proxy configuration, monitoring, and secret provisioning remain deployment work.
 - The exchange holiday file requires annual maintenance.

@@ -45,6 +45,8 @@ func TestCalendarRejectsWrongYearAndConflictingDates(t *testing.T) {
 		`{"year":2026,"holidays":["2027-01-01"],"special_trading_days":[]}`,
 		`{"year":2026,"holidays":["2026-07-21"],"special_trading_days":["2026-07-21"]}`,
 		`{"year":2026,"holidays":["2026-07-21","2026-07-21"],"special_trading_days":[]}`,
+		`{"year":2026,"holidayz":["2026-07-21"],"holidays":[],"special_trading_days":[]}`,
+		`{"year":2026,"holidays":[],"special_trading_days":[]} {"year":2027}`,
 	}
 	for index, data := range tests {
 		path := filepath.Join(t.TempDir(), "calendar.json")

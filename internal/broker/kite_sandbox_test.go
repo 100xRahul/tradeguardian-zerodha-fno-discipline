@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"math"
 	"os"
 	"testing"
 	"time"
@@ -51,10 +52,27 @@ func TestKiteSandboxSmoke(t *testing.T) {
 	if future.TradingSymbol == "" {
 		t.Fatal("sandbox NFO instrument dump contained no usable future")
 	}
+	if err := kite.waitRateLimit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	kite.mu.RLock()
+	quotes, err := kite.trade.GetLTP(future.Exchange + ":" + future.TradingSymbol)
+	kite.mu.RUnlock()
+	if err != nil {
+		t.Fatalf("GetLTP(): %v", err)
+	}
+	quote, ok := quotes[future.Exchange+":"+future.TradingSymbol]
+	if !ok || quote.LastPrice <= 0 {
+		t.Fatal("sandbox returned no usable LTP for the selected future")
+	}
+	restingPrice := math.Floor((quote.LastPrice*0.99)/future.TickSize) * future.TickSize
+	if restingPrice <= 0 {
+		t.Fatal("calculated sandbox resting price is invalid")
+	}
 	orderID, err := kite.Place(ctx, domain.OrderRequest{
 		Variety: "regular", Exchange: future.Exchange, TradingSymbol: future.TradingSymbol,
 		Product: "NRML", OrderType: "LIMIT", TransactionType: "BUY", Validity: "DAY",
-		Quantity: future.LotSize, Price: future.TickSize, Tag: "tg-sandbox-smoke",
+		Quantity: future.LotSize, Price: restingPrice, Tag: "tgsandboxsmoke",
 	})
 	if err != nil {
 		t.Fatalf("Place(): %v", err)

@@ -149,7 +149,14 @@ function renderPositions(rows = []) {
 }
 
 function renderOrders(rows = []) {
-  byId('orders').innerHTML = rows.length ? rows.map(order => `<tr><td class="mono">${escapeHTML(order.order_id)}</td><td>${escapeHTML(order.exchange)}:${escapeHTML(order.tradingsymbol)}</td><td>${escapeHTML(order.transaction_type)}</td><td>${escapeHTML(order.order_type)}</td><td>${order.quantity} / ${order.pending_quantity}</td><td>${escapeHTML(order.status)}</td><td>${order.pending_quantity > 0 ? `<button class="secondary small" data-modify="${escapeHTML(order.order_id)}">Modify</button> <button class="danger-button small" data-cancel="${escapeHTML(order.order_id)}">Cancel</button>` : ''}</td></tr>`).join('') : '<tr><td colspan="7" class="empty">No orders today</td></tr>';
+	const terminal = new Set(['COMPLETE', 'CANCELLED', 'REJECTED']);
+	byId('orders').innerHTML = rows.length ? rows.map(order => {
+		const cancellable = !terminal.has(order.status);
+		const remaining = order.pending_quantity > 0
+			? order.pending_quantity
+			: Math.max(0, order.quantity - order.filled_quantity - order.cancelled_quantity);
+		return `<tr><td class="mono">${escapeHTML(order.order_id)}</td><td>${escapeHTML(order.exchange)}:${escapeHTML(order.tradingsymbol)}</td><td>${escapeHTML(order.transaction_type)}</td><td>${escapeHTML(order.order_type)}</td><td>${order.quantity} / ${remaining}</td><td>${escapeHTML(order.status)}</td><td>${cancellable ? `<button class="secondary small" data-modify="${escapeHTML(order.order_id)}">Modify</button> <button class="danger-button small" data-cancel="${escapeHTML(order.order_id)}">Cancel</button>` : ''}</td></tr>`;
+	}).join('') : '<tr><td colspan="7" class="empty">No orders today</td></tr>';
 }
 
 function renderAudit(rows = []) {

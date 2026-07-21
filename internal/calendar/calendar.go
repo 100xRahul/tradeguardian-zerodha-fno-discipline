@@ -1,14 +1,18 @@
 package calendar
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"time"
 )
 
 type fileData struct {
 	Year           int      `json:"year"`
+	Source         string   `json:"source"`
 	Holidays       []string `json:"holidays"`
 	SpecialTrading []string `json:"special_trading_days"`
 }
@@ -30,8 +34,13 @@ func Load(path string) (*Calendar, error) {
 		return nil, fmt.Errorf("read trading calendar: %w", err)
 	}
 	var decoded fileData
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
 		return nil, fmt.Errorf("decode trading calendar: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("decode trading calendar: expected one JSON object")
 	}
 	if decoded.Year < 2000 {
 		return nil, fmt.Errorf("trading calendar year is required")

@@ -63,6 +63,11 @@ func (s *SQLite) migrate(ctx context.Context) error {
 			order_id TEXT NOT NULL,
 			created_at TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS liquidation_intents (
+			position_key TEXT PRIMARY KEY,
+			order_id TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -240,6 +245,53 @@ func (s *SQLite) CompleteIdempotency(ctx context.Context, key, reference, result
 	}
 	if changed != 1 {
 		return fmt.Errorf("idempotency reservation changed before completion")
+	}
+	return nil
+}
+
+func (s *SQLite) ListLiquidationIntents(ctx context.Context) ([]domain.LiquidationIntent, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT position_key, order_id, created_at FROM liquidation_intents ORDER BY position_key`)
+	if err != nil {
+		return nil, fmt.Errorf("list liquidation intents: %w", err)
+	}
+	defer rows.Close()
+	intents := make([]domain.LiquidationIntent, 0)
+	for rows.Next() {
+		var intent domain.LiquidationIntent
+		var createdAt string
+		if err := rows.Scan(&intent.PositionKey, &intent.OrderID, &createdAt); err != nil {
+			return nil, fmt.Errorf("scan liquidation intent: %w", err)
+		}
+		intent.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAt)
+		if err != nil {
+			return nil, fmt.Errorf("parse liquidation intent timestamp: %w", err)
+		}
+		intents = append(intents, intent)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate liquidation intents: %w", err)
+	}
+	return intents, nil
+}
+
+func (s *SQLite) PutLiquidationIntent(ctx context.Context, intent domain.LiquidationIntent) error {
+	if intent.PositionKey == "" || intent.OrderID == "" || intent.CreatedAt.IsZero() {
+		return fmt.Errorf("liquidation intent requires position key, order id, and timestamp")
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO liquidation_intents (position_key, order_id, created_at) VALUES (?, ?, ?) ON CONFLICT(position_key) DO UPDATE SET order_id = excluded.order_id, created_at = excluded.created_at`,
+		intent.PositionKey, intent.OrderID, formatTime(intent.CreatedAt))
+	if err != nil {
+		return fmt.Errorf("persist liquidation intent: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLite) DeleteLiquidationIntent(ctx context.Context, positionKey string) error {
+	if positionKey == "" {
+		return fmt.Errorf("liquidation position key is required")
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM liquidation_intents WHERE position_key = ?`, positionKey); err != nil {
+		return fmt.Errorf("delete liquidation intent: %w", err)
 	}
 	return nil
 }

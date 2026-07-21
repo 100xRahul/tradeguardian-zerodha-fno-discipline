@@ -40,6 +40,11 @@ func TestEvaluateOrderPolicy(t *testing.T) {
 		{name: "unsupported exchange", change: func(o *domain.OrderRequest) { o.Exchange = "MCX" }, trading: domain.TradingActive, runtime: domain.RuntimeReady, code: domain.CodeUnsupportedSegment},
 		{name: "unsupported variety", change: func(o *domain.OrderRequest) { o.Variety = "amo" }, trading: domain.TradingActive, runtime: domain.RuntimeReady, code: domain.CodeUnsupportedVariety},
 		{name: "SL needs limit price", change: func(o *domain.OrderRequest) { o.OrderType, o.TriggerPrice, o.Price = "SL", 100, 0 }, trading: domain.TradingActive, runtime: domain.RuntimeReady, code: domain.CodeInvalidOrder},
+		{name: "MARKET rejects price", change: func(o *domain.OrderRequest) { o.Price = 100 }, trading: domain.TradingActive, runtime: domain.RuntimeReady, code: domain.CodeInvalidOrder},
+		{name: "MARKET rejects trigger", change: func(o *domain.OrderRequest) { o.TriggerPrice = 100 }, trading: domain.TradingActive, runtime: domain.RuntimeReady, code: domain.CodeInvalidOrder},
+		{name: "LIMIT rejects trigger", change: func(o *domain.OrderRequest) { o.OrderType, o.Price, o.TriggerPrice = "LIMIT", 100, 99 }, trading: domain.TradingActive, runtime: domain.RuntimeReady, code: domain.CodeInvalidOrder},
+		{name: "SL-M rejects price", change: func(o *domain.OrderRequest) { o.OrderType, o.Price, o.TriggerPrice = "SL-M", 100, 99 }, trading: domain.TradingActive, runtime: domain.RuntimeReady, code: domain.CodeInvalidOrder},
+		{name: "valid SL", change: func(o *domain.OrderRequest) { o.OrderType, o.Price, o.TriggerPrice = "SL", 100, 99 }, trading: domain.TradingActive, runtime: domain.RuntimeReady, allowed: true, code: domain.CodeApproved},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -58,14 +63,24 @@ func TestEvaluateOrderPolicy(t *testing.T) {
 
 func TestDailyFNOMTM(t *testing.T) {
 	positions := []domain.Position{{Exchange: "NFO", M2M: -20_000.004}, {Exchange: "BFO", M2M: -9_999.996}, {Exchange: "MCX", M2M: -100_000}}
-	if got := DailyFNOMTM(positions); got != domain.LossLimitPaise {
+	got, err := DailyFNOMTM(positions)
+	if err != nil || got != domain.LossLimitPaise {
 		t.Fatalf("DailyFNOMTM() = %d, want %d", got, domain.LossLimitPaise)
 	}
 }
 
 func TestDailyFNOMTMSumsBeforeRoundingToPaise(t *testing.T) {
 	positions := []domain.Position{{Exchange: "NFO", M2M: -15_000.004}, {Exchange: "BFO", M2M: -15_000.004}}
-	if got := DailyFNOMTM(positions); got != domain.LossLimitPaise-1 {
+	got, err := DailyFNOMTM(positions)
+	if err != nil || got != domain.LossLimitPaise-1 {
 		t.Fatalf("DailyFNOMTM() = %d, want %d", got, domain.LossLimitPaise-1)
+	}
+}
+
+func TestDailyFNOMTMRejectsNonFiniteBrokerValues(t *testing.T) {
+	for _, value := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		if _, err := DailyFNOMTM([]domain.Position{{Exchange: "NFO", TradingSymbol: "BAD", M2M: value}}); err == nil {
+			t.Fatalf("DailyFNOMTM(%v) error = nil", value)
+		}
 	}
 }

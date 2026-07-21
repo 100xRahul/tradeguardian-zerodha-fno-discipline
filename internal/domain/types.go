@@ -3,7 +3,6 @@ package domain
 import (
 	"context"
 	"errors"
-	"math"
 	"time"
 )
 
@@ -45,6 +44,7 @@ const (
 	LossLimitPaise int64 = -3_000_000
 	LockMessage          = "Daily Loss Limit Reached. Trading Locked Until Tomorrow."
 	LockedMessage        = "Trading is locked for today."
+	ForcedExitTag        = "tgforceexit"
 )
 
 var ErrNotAuthenticated = errors.New("kite session is not authenticated")
@@ -133,6 +133,7 @@ type Order struct {
 	Quantity        int      `json:"quantity"`
 	PendingQuantity int      `json:"pending_quantity"`
 	FilledQuantity  int      `json:"filled_quantity"`
+	CancelledQty    int      `json:"cancelled_quantity"`
 	Price           float64  `json:"price"`
 	TriggerPrice    float64  `json:"trigger_price"`
 	StatusMessage   string   `json:"status_message,omitempty"`
@@ -141,15 +142,29 @@ type Order struct {
 }
 
 func (o Order) Cancellable() bool {
-	if o.PendingQuantity <= 0 {
-		return false
-	}
 	switch o.Status {
 	case "COMPLETE", "CANCELLED", "REJECTED":
 		return false
 	default:
 		return true
 	}
+}
+
+// RemainingQuantity prefers Kite's explicit pending quantity. Interim OMS
+// states can briefly report zero pending quantity before registration, so a
+// nonterminal order falls back to its unfilled, uncancelled quantity.
+func (o Order) RemainingQuantity() int {
+	if !o.Cancellable() {
+		return 0
+	}
+	if o.PendingQuantity > 0 {
+		return o.PendingQuantity
+	}
+	remaining := o.Quantity - o.FilledQuantity - o.CancelledQty
+	if remaining > 0 {
+		return remaining
+	}
+	return 0
 }
 
 type Instrument struct {
@@ -201,6 +216,12 @@ type AuditEvent struct {
 	Metadata  map[string]any `json:"metadata,omitempty"`
 }
 
+type LiquidationIntent struct {
+	PositionKey string
+	OrderID     string
+	CreatedAt   time.Time
+}
+
 type StateStore interface {
 	CurrentLock(ctx context.Context) (LockRecord, error)
 	Lock(ctx context.Context, record LockRecord, event AuditEvent) error
@@ -211,6 +232,9 @@ type StateStore interface {
 	LookupIdempotency(ctx context.Context, key string) (result string, found bool, err error)
 	ReserveIdempotency(ctx context.Context, key, reference string, at time.Time) (existing string, reserved bool, err error)
 	CompleteIdempotency(ctx context.Context, key, reference, result string) error
+	ListLiquidationIntents(ctx context.Context) ([]LiquidationIntent, error)
+	PutLiquidationIntent(ctx context.Context, intent LiquidationIntent) error
+	DeleteLiquidationIntent(ctx context.Context, positionKey string) error
 	Close() error
 }
 
@@ -228,8 +252,6 @@ type Snapshot struct {
 	OpenPositionQty int           `json:"open_position_quantity"`
 	PendingOrders   int           `json:"pending_orders"`
 }
-
-func RupeesToPaise(value float64) int64 { return int64(math.Round(value * 100)) }
 
 func IsFNOExchange(exchange string) bool { return exchange == "NFO" || exchange == "BFO" }
 

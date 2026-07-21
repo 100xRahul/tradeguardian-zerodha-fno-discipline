@@ -39,7 +39,7 @@ func ValidateBasket(request domain.BasketRequest, instruments map[string]domain.
 		if !ok || !domain.IsOptionType(instrument.InstrumentType) {
 			return ValidatedBasket{}, fmt.Errorf("leg %d is not a recognised option contract", index+1)
 		}
-		if strings.TrimSpace(instrument.Name) == "" || instrument.Expiry.IsZero() || instrument.Strike <= 0 {
+		if strings.TrimSpace(instrument.Name) == "" || instrument.Expiry.IsZero() || instrument.Strike <= 0 || math.IsNaN(instrument.Strike) || math.IsInf(instrument.Strike, 0) || math.IsNaN(instrument.TickSize) || math.IsInf(instrument.TickSize, 0) {
 			return ValidatedBasket{}, fmt.Errorf("leg %d has incomplete underlying, expiry, or strike metadata", index+1)
 		}
 		if leg.Product != "MIS" && leg.Product != "NRML" {
@@ -100,7 +100,11 @@ func ValidateBasket(request domain.BasketRequest, instruments map[string]domain.
 		return ValidatedBasket{}, fmt.Errorf("basket maximum loss could not be calculated")
 	}
 	if minimum < 0 {
-		validated.MaxLossPaise = domain.RupeesToPaise(-minimum)
+		lossPaise := math.Round(-minimum * 100)
+		if math.IsInf(lossPaise, 0) || math.IsNaN(lossPaise) || lossPaise > math.MaxInt64 {
+			return ValidatedBasket{}, fmt.Errorf("basket maximum loss exceeds the supported monetary range")
+		}
+		validated.MaxLossPaise = int64(lossPaise)
 	}
 	return validated, nil
 }

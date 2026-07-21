@@ -1,6 +1,7 @@
 package risk
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -23,6 +24,21 @@ func TestValidateBasketBullCallSpread(t *testing.T) {
 	}
 	if validated.MaxLossPaise != 250_000 {
 		t.Fatalf("MaxLossPaise = %d, want 250000", validated.MaxLossPaise)
+	}
+}
+
+func TestValidateBasketRejectsMaximumLossOutsidePaiseRange(t *testing.T) {
+	expiry := time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC)
+	instruments := map[string]domain.Instrument{
+		"NFO:LOWCE":  {Exchange: "NFO", TradingSymbol: "LOWCE", Name: "NIFTY", InstrumentType: "CE", Expiry: expiry, Strike: 25_000, LotSize: 1},
+		"NFO:HIGHCE": {Exchange: "NFO", TradingSymbol: "HIGHCE", Name: "NIFTY", InstrumentType: "CE", Expiry: expiry, Strike: 25_100, LotSize: 1},
+	}
+	request := domain.BasketRequest{Legs: []domain.BasketLeg{
+		{Exchange: "NFO", TradingSymbol: "LOWCE", Product: "MIS", TransactionType: "BUY", Quantity: 1_000_000_000, LimitPrice: 100_000_000},
+		{Exchange: "NFO", TradingSymbol: "HIGHCE", Product: "MIS", TransactionType: "SELL", Quantity: 1_000_000_000, LimitPrice: 1},
+	}}
+	if _, err := ValidateBasket(request, instruments); err == nil || !strings.Contains(err.Error(), "monetary range") {
+		t.Fatalf("ValidateBasket() error = %v", err)
 	}
 }
 

@@ -76,6 +76,20 @@ func (e *Engine) Evaluate(request domain.OrderRequest, trading domain.TradingSta
 	if (request.OrderType == "SL" || request.OrderType == "SL-M") && request.TriggerPrice <= 0 {
 		return reject(domain.CodeInvalidOrder, "A positive trigger price is required for stop-loss orders.")
 	}
+	switch request.OrderType {
+	case "MARKET":
+		if request.Price != 0 || request.TriggerPrice != 0 {
+			return reject(domain.CodeInvalidOrder, "MARKET orders must not include price or trigger price.")
+		}
+	case "LIMIT":
+		if request.TriggerPrice != 0 {
+			return reject(domain.CodeInvalidOrder, "LIMIT orders must not include a trigger price.")
+		}
+	case "SL-M":
+		if request.Price != 0 {
+			return reject(domain.CodeInvalidOrder, "SL-M orders must not include a limit price.")
+		}
+	}
 	if domain.IsOptionType(request.InstrumentType) && request.TransactionType == "BUY" {
 		return reject(domain.CodeOptionBuyForbidden, "Standalone CE/PE BUY orders are forbidden. Use the validated hedge-basket workflow.")
 	}
@@ -88,12 +102,22 @@ func (e *Engine) Evaluate(request domain.OrderRequest, trading domain.TradingSta
 	return decision
 }
 
-func DailyFNOMTM(positions []domain.Position) int64 {
+func DailyFNOMTM(positions []domain.Position) (int64, error) {
 	var total float64
 	for _, position := range positions {
 		if domain.IsFNOExchange(position.Exchange) {
+			if math.IsNaN(position.M2M) || math.IsInf(position.M2M, 0) {
+				return 0, fmt.Errorf("%s:%s has non-finite m2m", position.Exchange, position.TradingSymbol)
+			}
 			total += position.M2M
+			if math.IsNaN(total) || math.IsInf(total, 0) {
+				return 0, fmt.Errorf("combined F&O m2m is outside the supported range")
+			}
 		}
 	}
-	return domain.RupeesToPaise(total)
+	paise := math.Round(total * 100)
+	if paise < math.MinInt64 || paise > math.MaxInt64 {
+		return 0, fmt.Errorf("combined F&O m2m is outside the supported range")
+	}
+	return int64(paise), nil
 }

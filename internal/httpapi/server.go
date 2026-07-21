@@ -286,11 +286,13 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 	// to its request context and heartbeat loop.
 	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
 	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Connection", "keep-alive")
 	updates, unsubscribe := s.broadcast.subscribe()
 	defer unsubscribe()
-	_, _ = io.WriteString(w, "event: state\ndata: refresh\n\n")
+	if _, err := io.WriteString(w, "event: state\ndata: refresh\n\n"); err != nil {
+		return
+	}
 	flusher.Flush()
 	heartbeat := time.NewTicker(15 * time.Second)
 	defer heartbeat.Stop()
@@ -299,10 +301,14 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case <-updates:
-			_, _ = io.WriteString(w, "event: state\ndata: refresh\n\n")
+			if _, err := io.WriteString(w, "event: state\ndata: refresh\n\n"); err != nil {
+				return
+			}
 			flusher.Flush()
 		case <-heartbeat.C:
-			_, _ = io.WriteString(w, ": heartbeat\n\n")
+			if _, err := io.WriteString(w, ": heartbeat\n\n"); err != nil {
+				return
+			}
 			flusher.Flush()
 		}
 	}
@@ -377,6 +383,7 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Content-Type-Options", "nosniff")

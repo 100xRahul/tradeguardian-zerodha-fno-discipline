@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -156,6 +157,33 @@ func TestOptionProtectionMustUseSameProduct(t *testing.T) {
 	}
 }
 
+func TestOptionCoverageFailsClosedWhenExistingPositionMetadataIsMissing(t *testing.T) {
+	app, broker, _ := newTestService(t, 0)
+	broker.positions = []domain.Position{
+		{Exchange: "NFO", TradingSymbol: "NIFTY26JUL25000CE", InstrumentToken: 2, Product: "MIS", Quantity: 50},
+		{Exchange: "NFO", TradingSymbol: "UNKNOWN", InstrumentToken: 999, Product: "MIS", Quantity: 1},
+	}
+	if err := app.Authenticate(context.Background(), "request"); err != nil {
+		t.Fatal(err)
+	}
+	decision, _, err := app.Place(context.Background(), validRequest("NIFTY26JUL25000CE", "SELL", 50))
+	if err != nil || decision.Code != domain.CodeUnhedgedExposure || decision.Allowed || broker.placeCalls != 0 {
+		t.Fatalf("decision=%#v calls=%d error=%v", decision, broker.placeCalls, err)
+	}
+}
+
+func TestBasketTagInTagsArrayCannotBeModified(t *testing.T) {
+	app, broker, _ := newTestService(t, 0)
+	if err := app.Authenticate(context.Background(), "request"); err != nil {
+		t.Fatal(err)
+	}
+	broker.orders = []domain.Order{{OrderID: "basket-leg", Variety: "regular", Status: "OPEN", Exchange: "NFO", TradingSymbol: "NIFTY26JUL25000CE", InstrumentToken: 2, Product: "MIS", OrderType: "LIMIT", TransactionType: "SELL", Validity: "IOC", Quantity: 50, PendingQuantity: 50, Tags: []string{"tgb123456"}}}
+	decision, _, err := app.Modify(context.Background(), "basket-leg", domain.ModifyRequest{IdempotencyKey: "modify-basket-123", Quantity: 50, OrderType: "LIMIT", Validity: "IOC", Price: 100})
+	if err != nil || decision.Code != domain.CodeInvalidOrder || decision.Allowed || broker.modifyCalls != 0 {
+		t.Fatalf("decision=%#v calls=%d error=%v", decision, broker.modifyCalls, err)
+	}
+}
+
 func TestExplicitPositionExitMatchesInstrumentAndProduct(t *testing.T) {
 	app, broker, _ := newTestService(t, 0)
 	broker.positions = []domain.Position{
@@ -183,6 +211,20 @@ func TestPartiallyAcceptedExitFailsClosedUntilReconciliation(t *testing.T) {
 	orderID, err := app.ExitPosition(context.Background(), 1, "MIS")
 	if err == nil || orderID == "" || app.Snapshot().RuntimeStatus != domain.RuntimeDegraded {
 		t.Fatalf("orderID=%q snapshot=%#v error=%v", orderID, app.Snapshot(), err)
+	}
+}
+
+func TestRepeatedExplicitExitDoesNotDuplicateUncertainSubmission(t *testing.T) {
+	app, broker, _ := newTestService(t, 0)
+	broker.positions = []domain.Position{{Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", InstrumentToken: 1, Product: "MIS", Quantity: 50}}
+	broker.exitInvisible = true
+	if err := app.Authenticate(context.Background(), "request"); err != nil {
+		t.Fatal(err)
+	}
+	firstID, firstErr := app.ExitPosition(context.Background(), 1, "MIS")
+	secondID, secondErr := app.ExitPosition(context.Background(), 1, "MIS")
+	if firstErr != nil || firstID == "" || secondErr == nil || secondID != firstID || broker.exitCalls != 1 {
+		t.Fatalf("first=(%q,%v) second=(%q,%v) calls=%d", firstID, firstErr, secondID, secondErr, broker.exitCalls)
 	}
 }
 
@@ -262,6 +304,119 @@ func TestExpiredSessionWhileReadingOrdersRequiresAuthentication(t *testing.T) {
 	snapshot := app.Snapshot()
 	if snapshot.Authenticated || snapshot.RuntimeStatus != domain.RuntimeAuthRequired {
 		t.Fatalf("snapshot = %#v", snapshot)
+	}
+}
+
+func TestInvalidBrokerMTMDegradesWithoutReplacingLastValidValue(t *testing.T) {
+	app, broker, _ := newTestService(t, 0)
+	if err := app.Authenticate(context.Background(), "request"); err != nil {
+		t.Fatal(err)
+	}
+	broker.positions = []domain.Position{{Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", InstrumentToken: 1, Product: "MIS", Quantity: 50, M2M: math.NaN()}}
+	if err := app.PollOnce(context.Background()); err == nil {
+		t.Fatal("PollOnce() error = nil")
+	}
+	snapshot := app.Snapshot()
+	if snapshot.RuntimeStatus != domain.RuntimeDegraded || snapshot.MTMPaise != 0 || snapshot.TradingStatus != domain.TradingActive {
+		t.Fatalf("snapshot=%#v", snapshot)
+	}
+}
+
+func TestExpiredSessionDuringPlacementReturnsAuthDecision(t *testing.T) {
+	app, broker, _ := newTestService(t, 0)
+	if err := app.Authenticate(context.Background(), "request"); err != nil {
+		t.Fatal(err)
+	}
+	broker.placeErr = domain.ErrNotAuthenticated
+	decision, _, err := app.Place(context.Background(), validRequest("NIFTY26JULFUT", "BUY", 50))
+	if !errors.Is(err, domain.ErrNotAuthenticated) || decision.Code != domain.CodeAuthRequired || decision.Allowed {
+		t.Fatalf("decision=%#v error=%v", decision, err)
+	}
+	if snapshot := app.Snapshot(); snapshot.Authenticated || snapshot.RuntimeStatus != domain.RuntimeAuthRequired {
+		t.Fatalf("snapshot=%#v", snapshot)
+	}
+}
+
+func TestLiquidationDoesNotDuplicateInvisibleSubmittedExit(t *testing.T) {
+	app, broker, _ := newTestService(t, 0)
+	broker.positions = []domain.Position{{Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", InstrumentToken: 1, Product: "MIS", Quantity: 50}}
+	broker.exitInvisible = true
+	if complete, err := app.liquidationPass(context.Background()); complete || err != nil {
+		t.Fatalf("first pass complete=%v error=%v", complete, err)
+	}
+	if complete, err := app.liquidationPass(context.Background()); complete || err == nil {
+		t.Fatalf("second pass complete=%v error=%v", complete, err)
+	}
+	if complete, err := app.liquidationPass(context.Background()); complete || err == nil {
+		t.Fatalf("third pass complete=%v error=%v", complete, err)
+	}
+	if broker.exitCalls != 1 {
+		t.Fatalf("exit calls=%d, want one uncertain submission", broker.exitCalls)
+	}
+}
+
+func TestInvisibleExitIntentIsNotClearedOnlyBecausePositionLooksFlat(t *testing.T) {
+	app, broker, _ := newTestService(t, 0)
+	broker.positions = []domain.Position{{Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", InstrumentToken: 1, Product: "MIS", Quantity: 50}}
+	broker.exitInvisible = true
+	if complete, err := app.liquidationPass(context.Background()); complete || err != nil {
+		t.Fatalf("first pass complete=%v error=%v", complete, err)
+	}
+	broker.positions = nil
+	for attempt := 0; attempt < 2; attempt++ {
+		if complete, err := app.liquidationPass(context.Background()); complete || err == nil {
+			t.Fatalf("uncertain pass %d complete=%v error=%v", attempt+1, complete, err)
+		}
+	}
+	if broker.exitCalls != 1 {
+		t.Fatalf("exit calls=%d", broker.exitCalls)
+	}
+}
+
+func TestUncertainExitIntentSurvivesServiceRestart(t *testing.T) {
+	app, broker, store := newTestService(t, 0)
+	broker.positions = []domain.Position{{Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", InstrumentToken: 1, Product: "MIS", Quantity: 50}}
+	broker.exitInvisible = true
+	if complete, err := app.liquidationPass(context.Background()); complete || err != nil {
+		t.Fatalf("first pass complete=%v error=%v", complete, err)
+	}
+	restarted, err := New(context.Background(), broker, store, app.calendar, log.New(io.Discard, "", 0), app.now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if complete, err := restarted.liquidationPass(context.Background()); complete || err == nil {
+		t.Fatalf("restarted pass complete=%v error=%v", complete, err)
+	}
+	if broker.exitCalls != 1 {
+		t.Fatalf("exit calls=%d after restart", broker.exitCalls)
+	}
+}
+
+func TestLiquidationRecognisesAutosliceChildByParentID(t *testing.T) {
+	app, broker, _ := newTestService(t, 0)
+	key := positionKeyFor("NFO", "NIFTY26JULFUT", "MIS")
+	app.forcedExits[key] = "parent-1"
+	broker.positions = []domain.Position{{Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", InstrumentToken: 1, Product: "MIS", Quantity: 50}}
+	broker.orders = []domain.Order{{OrderID: "child-1", ParentOrderID: "parent-1", Variety: "regular", Status: "OPEN", Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", Product: "MIS", Quantity: 50, PendingQuantity: 50}}
+	if complete, err := app.liquidationPass(context.Background()); complete || err != nil {
+		t.Fatalf("complete=%v error=%v", complete, err)
+	}
+	if broker.exitCalls != 0 || broker.cancelCalls != 0 {
+		t.Fatalf("exit calls=%d cancel calls=%d", broker.exitCalls, broker.cancelCalls)
+	}
+}
+
+func TestLiquidationCancelsForcedExitAfterPositionIsFlat(t *testing.T) {
+	app, broker, _ := newTestService(t, 0)
+	broker.orders = []domain.Order{{OrderID: "orphan-exit", Variety: "regular", Status: "OPEN", Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", Product: "MIS", Quantity: 50, PendingQuantity: 50, Tag: forcedExitTag}}
+	if complete, err := app.liquidationPass(context.Background()); complete || err != nil {
+		t.Fatalf("first pass complete=%v error=%v", complete, err)
+	}
+	if broker.cancelCalls != 1 {
+		t.Fatalf("cancel calls=%d", broker.cancelCalls)
+	}
+	if complete, err := app.liquidationPass(context.Background()); !complete || err != nil {
+		t.Fatalf("second pass complete=%v error=%v", complete, err)
 	}
 }
 
@@ -476,9 +631,11 @@ type fakeBroker struct {
 	placedSides    []string
 	placedRequests []domain.OrderRequest
 	failPlace      bool
+	placeErr       error
 	partialSell    bool
 	failShortClose bool
 	ordersErr      error
+	exitInvisible  bool
 }
 
 func (f *fakeBroker) LoginURL(string) string { return "https://example.invalid/login" }
@@ -520,6 +677,9 @@ func (f *fakeBroker) Place(_ context.Context, request domain.OrderRequest) (stri
 	defer f.mu.Unlock()
 	f.placeCalls++
 	f.placedRequests = append(f.placedRequests, request)
+	if f.placeErr != nil {
+		return "", f.placeErr
+	}
 	if f.failPlace || (f.failShortClose && request.OrderType == "MARKET" && request.TransactionType == "BUY") {
 		return "", errors.New("placement failed")
 	}
@@ -561,6 +721,9 @@ func (f *fakeBroker) ExitPosition(_ context.Context, position domain.Position) (
 	defer f.mu.Unlock()
 	f.exitCalls++
 	f.exitedProducts = append(f.exitedProducts, position.Product)
+	if f.exitInvisible {
+		return "exit-invisible", nil
+	}
 	for index := range f.positions {
 		if f.positions[index].InstrumentToken == position.InstrumentToken && f.positions[index].Product == position.Product {
 			f.positions[index].Quantity = 0
@@ -579,6 +742,7 @@ type fakeStore struct {
 	record      domain.LockRecord
 	events      []domain.AuditEvent
 	idempotency map[string]string
+	intents     map[string]domain.LiquidationIntent
 }
 
 func (f *fakeStore) CurrentLock(context.Context) (domain.LockRecord, error) { return f.record, nil }
@@ -609,6 +773,8 @@ func (f *fakeStore) AppendAudit(_ context.Context, event domain.AuditEvent) erro
 	return nil
 }
 func (f *fakeStore) ListAudit(context.Context, int) ([]domain.AuditEvent, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return append([]domain.AuditEvent(nil), f.events...), nil
 }
 func (f *fakeStore) LookupIdempotency(_ context.Context, key string) (string, bool, error) {
@@ -633,6 +799,30 @@ func (f *fakeStore) CompleteIdempotency(_ context.Context, key, reference, resul
 		return errors.New("reservation changed")
 	}
 	f.idempotency[key] = result
+	return nil
+}
+func (f *fakeStore) ListLiquidationIntents(context.Context) ([]domain.LiquidationIntent, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	result := make([]domain.LiquidationIntent, 0, len(f.intents))
+	for _, intent := range f.intents {
+		result = append(result, intent)
+	}
+	return result, nil
+}
+func (f *fakeStore) PutLiquidationIntent(_ context.Context, intent domain.LiquidationIntent) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.intents == nil {
+		f.intents = make(map[string]domain.LiquidationIntent)
+	}
+	f.intents[intent.PositionKey] = intent
+	return nil
+}
+func (f *fakeStore) DeleteLiquidationIntent(_ context.Context, positionKey string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.intents, positionKey)
 	return nil
 }
 func (f *fakeStore) Close() error { return nil }

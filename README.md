@@ -8,6 +8,7 @@ For a product-level explanation of the implemented behavior, workflows, safety r
 
 - Polls NFO/BFO net positions every second and sums their `m2m` values.
 - At or below −₹30,000, persists `LOCKED`, cancels pending F&O orders, submits protected market exits, and reconciles until flat.
+- Treats all nonterminal Kite OMS states as live and tracks forced-exit parent IDs so an uncertain/autosliced exit is not duplicated.
 - Rejects standalone CE/PE BUY orders. The basket builder permits validated same-underlying/same-expiry hedges, confirms protective BUY IOC fills before submitting SELL legs, and rolls incomplete baskets back.
 - Rejects an individual option SELL if it would leave uncovered short quantity after simulating the resulting position.
 - Fails closed when monitoring is unavailable. Cancellation and full position exits remain available.
@@ -55,7 +56,7 @@ Do not expose the dashboard until the reverse proxy enforces authentication: thi
 
 ## Storage and recovery
 
-The SQLite database defaults to `data/tradeguardian.db`, is created with owner-only permissions, and contains lock state, liquidation progress, idempotency records, and redacted audit events. It contains no Kite credentials or access tokens.
+The SQLite database defaults to `data/tradeguardian.db`, is created with owner-only permissions, and contains lock state, liquidation progress, durable exit intents, idempotency records, and redacted audit events. It contains no Kite credentials or access tokens.
 
 Back up the database only while the app is stopped. Restoring an older backup can restore an older lock state, so inspect `trading_state` before starting after a restore. If a lock is active, do not edit the database; let automatic unlock handle it.
 
@@ -80,7 +81,7 @@ KITE_SANDBOX_REQUEST_TOKEN='<one-time-request-token>' \
 go test -run TestKiteSandboxSmoke -count=1 ./internal/broker
 ```
 
-This test reads instruments and account state, submits one very low-priced NFO futures LIMIT order, and cancels it if it remains pending. It runs only against the explicitly selected Kite sandbox and never runs as part of ordinary tests.
+This test reads instruments, LTP, and account state, submits one NFO futures LIMIT order approximately 1% below LTP, and cancels it if it remains pending. It runs only against the explicitly selected Kite sandbox and never runs as part of ordinary tests.
 
 ## API references
 

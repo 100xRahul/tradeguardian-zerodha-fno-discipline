@@ -22,15 +22,15 @@ Build a single-user Go web application bound to `127.0.0.1` that places, modifie
 - Never unwind protective long fills while final short fills or short-closing rollback orders are uncertain; retain protection and fail closed for attention.
 - Persist `ACTIVE` or `LOCKED`; expose `AUTH_REQUIRED`, `READY`, `MONITORING_DEGRADED`, `BASKET_DEPLOYING`, and `LIQUIDATING` runtime states.
 - Serialize risk decisions and submission. Conservatively cache accepted orders as pending immediately so rapid requests cannot reuse stale hedge coverage; require a fresh portfolio poll after basket deployment or explicit exits. When locked, reject placements and modifications with `Trading is locked for today.` Cancellations remain available.
-- Poll positions immediately after authentication and once per second thereafter. Sum NFO/BFO net-position `m2m`, converted to paise.
-- At MTM `<= -₹30,000`, persist `LOCKED` first, publish `Daily Loss Limit Reached. Trading Locked Until Tomorrow.`, cancel pending F&O orders, exit all nonzero F&O positions, and reconcile until flat.
+- Poll positions immediately after authentication and once per second thereafter. Sum finite NFO/BFO net-position `m2m`, converted to paise; invalid/non-representable broker MTM data degrades monitoring instead of entering a threshold comparison.
+- At MTM `<= -₹30,000`, persist `LOCKED` first, publish `Daily Loss Limit Reached. Trading Locked Until Tomorrow.`, cancel pending F&O orders, exit all nonzero F&O positions, and reconcile until flat. Treat every nonterminal Kite OMS state as live, retain forced-exit parent intents across retries/restart, recognise autoslice children, and cancel orphan exits that could reverse a flat position.
 - Sum included `m2m` values before the single rupees-to-paise rounding boundary. Reserve idempotency keys durably before broker submission so an uncertain response cannot be retried as a duplicate.
 - If monitoring fails, fail closed for placements/modifications while permitting cancellation and explicit risk-reducing exits.
 - Direct Kite orders are outside the pre-trade gate but still affect monitored MTM.
 
 ## Unlock and persistence
 
-- Persist lock date, trigger MTM/time, unlock time, liquidation progress, and append-only audit events in SQLite.
+- Persist lock date, trigger MTM/time, unlock time, liquidation progress, pre-submission liquidation intents, and append-only audit events in SQLite.
 - Unlock automatically at 09:15 Asia/Kolkata on the next weekday not listed in the exchange-holiday file, including after restart. There is no manual unlock route or control.
 - Withhold scheduled unlock while liquidation is not reconciled `COMPLETED`; unresolved broker risk remains locked and requires reauthentication/reconciliation.
 - Validate the holiday file and document its annual maintenance.

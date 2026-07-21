@@ -146,7 +146,7 @@ func (k *Kite) Orders(ctx context.Context) ([]domain.Order, error) {
 			InstrumentToken: order.InstrumentToken, Product: order.Product,
 			OrderType: order.OrderType, TransactionType: order.TransactionType,
 			Validity: order.Validity, Quantity: int(order.Quantity),
-			PendingQuantity: int(order.PendingQuantity), FilledQuantity: int(order.FilledQuantity), Price: order.Price,
+			PendingQuantity: int(order.PendingQuantity), FilledQuantity: int(order.FilledQuantity), CancelledQty: int(order.CancelledQuantity), Price: order.Price,
 			TriggerPrice: order.TriggerPrice, StatusMessage: order.StatusMessage,
 			Tag: order.Tag, Tags: append([]string(nil), order.Tags...),
 		})
@@ -165,7 +165,7 @@ func (k *Kite) Instruments(ctx context.Context, exchange string) ([]domain.Instr
 	defer k.mu.RUnlock()
 	instruments, err := k.market.GetInstrumentsByExchange(exchange)
 	if err != nil {
-		return nil, fmt.Errorf("get %s instruments: %w", exchange, err)
+		return nil, kiteError("get "+exchange+" instruments", err)
 	}
 	result := make([]domain.Instrument, 0, len(instruments))
 	for _, instrument := range instruments {
@@ -261,7 +261,7 @@ func (k *Kite) ExitPosition(ctx context.Context, position domain.Position) (stri
 	request := domain.OrderRequest{
 		Variety: "regular", Exchange: position.Exchange, TradingSymbol: position.TradingSymbol,
 		Product: position.Product, OrderType: "MARKET", TransactionType: transaction,
-		Validity: "DAY", Quantity: quantity, Tag: "tg-force-exit",
+		Validity: "DAY", Quantity: quantity, Tag: domain.ForcedExitTag,
 	}
 	if err := ctx.Err(); err != nil {
 		return "", err

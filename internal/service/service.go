@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	forcedExitTag       = "tg-force-exit"
+	forcedExitTag       = domain.ForcedExitTag
 	pendingOrderPrefix  = "pending-order:"
 	pendingModifyPrefix = "pending-modify:"
 )
@@ -44,6 +44,8 @@ type Service struct {
 	instruments   map[string]domain.Instrument
 	lockRecord    domain.LockRecord
 	attention     map[string]int
+	forcedExits   map[string]string
+	forcedExitAt  map[string]time.Time
 	hardAttention bool
 	lockPersisted bool
 }
@@ -66,10 +68,20 @@ func New(ctx context.Context, broker domain.Broker, store domain.StateStore, cal
 		broker: broker, store: store, calendar: cal, risk: risk.New(now), now: now,
 		log: logger, notify: func() {}, trading: record.Status, runtime: domain.RuntimeAuthRequired,
 		instruments: make(map[string]domain.Instrument), lockRecord: record,
-		attention: make(map[string]int), lockPersisted: true,
+		attention: make(map[string]int), forcedExits: make(map[string]string), forcedExitAt: make(map[string]time.Time), lockPersisted: true,
 	}
 	if err := service.maybeUnlockLocked(ctx); err != nil {
 		return nil, err
+	}
+	intents, err := store.ListLiquidationIntents(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, intent := range intents {
+		if intent.PositionKey != "" && intent.OrderID != "" {
+			service.forcedExits[intent.PositionKey] = intent.OrderID
+			service.forcedExitAt[intent.PositionKey] = intent.CreatedAt
+		}
 	}
 	return service, nil
 }
@@ -97,8 +109,12 @@ func (s *Service) Authenticate(ctx context.Context, requestToken string) error {
 	s.gate.Unlock()
 	if err := s.refreshInstruments(ctx); err != nil {
 		s.gate.Lock()
-		s.runtime = domain.RuntimeDegraded
-		s.lockRecord.LastError = "instrument catalogue unavailable"
+		if errors.Is(err, domain.ErrNotAuthenticated) {
+			s.setAuthRequiredLocked("Kite session expired; reconnect to resume monitoring")
+		} else {
+			s.runtime = domain.RuntimeDegraded
+			s.lockRecord.LastError = "instrument catalogue unavailable"
+		}
 		s.gate.Unlock()
 		s.signal()
 		return err
@@ -160,8 +176,12 @@ func (s *Service) PollOnce(ctx context.Context) error {
 	if needsInstruments {
 		if err := s.refreshInstruments(ctx); err != nil {
 			s.gate.Lock()
-			s.runtime = domain.RuntimeDegraded
-			s.lockRecord.LastError = "instrument catalogue unavailable"
+			if errors.Is(err, domain.ErrNotAuthenticated) {
+				s.setAuthRequiredLocked("Kite session expired; reconnect to resume monitoring")
+			} else {
+				s.runtime = domain.RuntimeDegraded
+				s.lockRecord.LastError = "instrument catalogue unavailable"
+			}
 			s.gate.Unlock()
 			s.signal()
 			return err
@@ -185,9 +205,19 @@ func (s *Service) PollOnce(ctx context.Context) error {
 		s.signal()
 		return err
 	}
+	mtm, err := risk.DailyFNOMTM(positions)
+	if err != nil {
+		s.runtime = domain.RuntimeDegraded
+		s.lockRecord.LastError = "position MTM data is invalid"
+		s.gate.Unlock()
+		s.auditBestEffort(ctx, domain.AuditEvent{Type: "MONITOR_ERROR", Code: domain.CodeMonitoringDegraded, Message: "Position MTM data was invalid."})
+		s.signal()
+		return err
+	}
 	s.positions = filterPositions(positions)
-	s.mtm = risk.DailyFNOMTM(positions)
+	s.mtm = mtm
 	s.lastUpdate = s.now()
+	intentCleanupErr := s.purgeExpiredExitIntentsLocked(ctx)
 	if s.trading == domain.TradingLocked && !s.lockPersisted {
 		s.retryLockPersistenceLocked(ctx)
 	}
@@ -195,7 +225,18 @@ func (s *Service) PollOnce(ctx context.Context) error {
 		s.enterDailyLossLockLocked(ctx)
 		s.gate.Unlock()
 		s.signal()
-		return s.liquidate(ctx)
+		return errors.Join(intentCleanupErr, s.liquidate(ctx))
+	}
+	if intentCleanupErr != nil {
+		if s.trading == domain.TradingLocked {
+			s.runtime = domain.RuntimeLiquidating
+		} else {
+			s.runtime = domain.RuntimeDegraded
+		}
+		s.lockRecord.LastError = "durable liquidation intent cleanup failed"
+		s.gate.Unlock()
+		s.signal()
+		return intentCleanupErr
 	}
 	orders, orderErr := s.broker.Orders(ctx)
 	if orderErr != nil {
@@ -349,7 +390,12 @@ func (s *Service) Place(ctx context.Context, request domain.OrderRequest) (domai
 	request.Tag = "tradeguardian"
 	orderID, err := s.broker.Place(ctx, request)
 	if err != nil {
-		decision = s.reject(domain.CodeBrokerError, "Zerodha did not accept the order request.")
+		if errors.Is(err, domain.ErrNotAuthenticated) {
+			s.setAuthRequiredLocked("Kite session expired while placing an order")
+			decision = s.reject(domain.CodeAuthRequired, "Kite session expired. Reconnect before trading.")
+		} else {
+			decision = s.reject(domain.CodeBrokerError, "Zerodha did not accept the order request.")
+		}
 		s.auditDecision(ctx, "ORDER_ERROR", decision, request, "")
 		return decision, "", err
 	}
@@ -383,13 +429,16 @@ func (s *Service) Modify(ctx context.Context, orderID string, request domain.Mod
 	}
 	orders, err := s.broker.Orders(ctx)
 	if err != nil {
+		if errors.Is(err, domain.ErrNotAuthenticated) {
+			s.setAuthRequiredLocked("Kite session expired while reading orders")
+		}
 		return s.reject(domain.CodeBrokerError, "Zerodha orders could not be read."), "", err
 	}
 	current, ok := findOrder(orders, orderID)
-	if !ok || !domain.IsFNOExchange(current.Exchange) || current.Variety != "regular" {
+	if !ok || !domain.IsFNOExchange(current.Exchange) || current.Variety != "regular" || !current.Cancellable() {
 		return s.reject(domain.CodeInvalidOrder, "A modifiable regular NFO/BFO order was not found."), "", nil
 	}
-	if strings.HasPrefix(current.Tag, "tgb") {
+	if orderHasTagPrefix(current, "tgb") {
 		return s.reject(domain.CodeInvalidOrder, "Basket legs cannot be modified individually."), "", nil
 	}
 	instrument, ok := s.instruments[instrumentKey(current.Exchange, current.TradingSymbol)]
@@ -443,7 +492,12 @@ func (s *Service) Modify(ctx context.Context, orderID string, request domain.Mod
 	}
 	modifiedID, err := s.broker.Modify(ctx, orderID, request)
 	if err != nil {
-		decision = s.reject(domain.CodeBrokerError, "Zerodha did not accept the modification.")
+		if errors.Is(err, domain.ErrNotAuthenticated) {
+			s.setAuthRequiredLocked("Kite session expired while modifying an order")
+			decision = s.reject(domain.CodeAuthRequired, "Kite session expired. Reconnect before trading.")
+		} else {
+			decision = s.reject(domain.CodeBrokerError, "Zerodha did not accept the modification.")
+		}
 		s.auditDecision(ctx, "MODIFY_ERROR", decision, candidate, orderID)
 		return decision, "", err
 	}
@@ -464,6 +518,9 @@ func (s *Service) Cancel(ctx context.Context, orderID string) error {
 	}
 	orders, err := s.broker.Orders(ctx)
 	if err != nil {
+		if errors.Is(err, domain.ErrNotAuthenticated) {
+			s.setAuthRequiredLocked("Kite session expired while reading orders")
+		}
 		return err
 	}
 	order, ok := findOrder(orders, orderID)
@@ -471,6 +528,9 @@ func (s *Service) Cancel(ctx context.Context, orderID string) error {
 		return fmt.Errorf("cancellable regular NFO/BFO order not found")
 	}
 	if err := s.broker.Cancel(ctx, "regular", orderID); err != nil {
+		if errors.Is(err, domain.ErrNotAuthenticated) {
+			s.setAuthRequiredLocked("Kite session expired while cancelling an order")
+		}
 		s.auditBestEffort(ctx, domain.AuditEvent{Type: "CANCEL_ERROR", Code: domain.CodeBrokerError, Message: "Order cancellation failed.", OrderID: orderID})
 		return err
 	}
@@ -649,7 +709,11 @@ func (s *Service) placeBasketLeg(ctx context.Context, request domain.OrderReques
 	if s.runtime != domain.RuntimeBasket {
 		return "", fmt.Errorf("basket deployment stopped because risk state changed")
 	}
-	return s.broker.Place(ctx, request)
+	orderID, err := s.broker.Place(ctx, request)
+	if errors.Is(err, domain.ErrNotAuthenticated) {
+		s.setAuthRequiredLocked("Kite session expired during basket deployment")
+	}
+	return orderID, err
 }
 
 func (s *Service) awaitPhase(ctx context.Context, phase []phaseOrder, timeout time.Duration) ([]phaseOrder, bool, error) {
@@ -660,6 +724,9 @@ func (s *Service) awaitPhase(ctx context.Context, phase []phaseOrder, timeout ti
 	for {
 		orders, err := s.broker.Orders(ctx)
 		if err != nil {
+			if errors.Is(err, domain.ErrNotAuthenticated) {
+				s.markAuthenticationRequired("Kite session expired during basket reconciliation")
+			}
 			return phase, false, err
 		}
 		allTerminal, allFilled := true, true
@@ -693,11 +760,17 @@ func (s *Service) awaitPhase(ctx context.Context, phase []phaseOrder, timeout ti
 func (s *Service) cancelPhase(ctx context.Context, phase []phaseOrder) {
 	orders, err := s.broker.Orders(ctx)
 	if err != nil {
+		if errors.Is(err, domain.ErrNotAuthenticated) {
+			s.markAuthenticationRequired("Kite session expired during basket cancellation")
+		}
 		return
 	}
 	for _, submitted := range phase {
 		if order, ok := findOrder(orders, submitted.OrderID); ok && order.Cancellable() {
-			_ = s.broker.Cancel(ctx, "regular", submitted.OrderID)
+			if err := s.broker.Cancel(ctx, "regular", submitted.OrderID); errors.Is(err, domain.ErrNotAuthenticated) {
+				s.markAuthenticationRequired("Kite session expired during basket cancellation")
+				return
+			}
 		}
 	}
 }
@@ -705,6 +778,9 @@ func (s *Service) cancelPhase(ctx context.Context, phase []phaseOrder) {
 func (s *Service) captureFills(ctx context.Context, phase []phaseOrder) ([]phaseOrder, error) {
 	orders, err := s.broker.Orders(ctx)
 	if err != nil {
+		if errors.Is(err, domain.ErrNotAuthenticated) {
+			s.markAuthenticationRequired("Kite session expired during basket reconciliation")
+		}
 		return phase, err
 	}
 	for index := range phase {
@@ -755,6 +831,9 @@ func (s *Service) rollbackPhase(ctx context.Context, fills []phaseOrder, tag str
 			Validity: "IOC", Quantity: submitted.Filled, Tag: tag,
 		})
 		if err != nil {
+			if errors.Is(err, domain.ErrNotAuthenticated) {
+				s.markAuthenticationRequired("Kite session expired during basket rollback")
+			}
 			submissionFailed = true
 			continue
 		}
@@ -781,7 +860,11 @@ func (s *Service) rollbackPhase(ctx context.Context, fills []phaseOrder, tag str
 
 func (s *Service) markBasketAttention(message string) {
 	s.gate.Lock()
-	s.runtime = domain.RuntimeDegraded
+	if !s.authed {
+		s.runtime = domain.RuntimeAuthRequired
+	} else {
+		s.runtime = domain.RuntimeDegraded
+	}
 	s.hardAttention = true
 	s.lockRecord.LastError = message
 	s.gate.Unlock()
@@ -840,18 +923,37 @@ func (s *Service) ExitPosition(ctx context.Context, token uint32, product string
 	}
 	positions, err := s.broker.Positions(ctx)
 	if err != nil {
+		if errors.Is(err, domain.ErrNotAuthenticated) {
+			s.setAuthRequiredLocked("Kite session expired while reading positions")
+		}
 		return "", err
 	}
 	for _, position := range positions {
 		if position.InstrumentToken == token && position.Product == product && domain.IsFNOExchange(position.Exchange) && position.Quantity != 0 {
+			key := positionKeyFor(position.Exchange, position.TradingSymbol, position.Product)
+			if existingID, submitted := s.forcedExits[key]; submitted {
+				found, active := intentOrderState(s.orders, existingID)
+				if !found || active {
+					return existingID, fmt.Errorf("a previous exit submission is still awaiting broker reconciliation")
+				}
+				delete(s.forcedExits, key)
+				delete(s.forcedExitAt, key)
+			}
 			if instrument, ok := s.instrumentByTokenLocked(token); ok && domain.IsOptionType(instrument.InstrumentType) {
 				if err := s.validateOptionCoverageLocked(instrument, position.Product, -position.Quantity, positions, nil); err != nil {
 					return "", err
 				}
 			}
+			if err := s.reserveForcedExitIntentLocked(ctx, key); err != nil {
+				return "", err
+			}
 			orderID, err := s.broker.ExitPosition(ctx, position)
 			if orderID != "" {
-				s.auditBestEffort(ctx, domain.AuditEvent{Type: "POSITION_EXIT", Code: domain.CodeApproved, Message: "Risk-reducing position exit submitted.", OrderID: orderID, Metadata: map[string]any{"instrument_token": token}})
+				s.forcedExits[key] = orderID
+				if persistErr := s.persistForcedExitIntentLocked(ctx, key, orderID); persistErr != nil {
+					err = errors.Join(err, persistErr)
+				}
+				s.auditBestEffort(ctx, domain.AuditEvent{Type: "POSITION_EXIT", Code: domain.CodeApproved, Message: "Risk-reducing position exit submitted.", OrderID: orderID, Metadata: map[string]any{"instrument_token": token, "exchange": position.Exchange, "tradingsymbol": position.TradingSymbol, "product": position.Product}})
 				if s.trading == domain.TradingActive {
 					s.runtime = domain.RuntimeDegraded
 					s.lockRecord.LastError = "position exit is awaiting a fresh broker reconciliation"
@@ -859,6 +961,9 @@ func (s *Service) ExitPosition(ctx context.Context, token uint32, product string
 				s.signalAsync()
 			}
 			if err != nil {
+				if errors.Is(err, domain.ErrNotAuthenticated) {
+					s.setAuthRequiredLocked("Kite session expired while exiting a position")
+				}
 				return orderID, err
 			}
 			return orderID, nil
@@ -888,6 +993,16 @@ func (s *Service) liquidate(ctx context.Context) error {
 			s.auditBestEffort(ctx, domain.AuditEvent{Type: "LIQUIDATION_COMPLETED", Code: domain.CodeApproved, Message: "All NFO/BFO orders cancelled and positions reconciled flat."})
 			s.signal()
 			return nil
+		}
+		if errors.Is(err, domain.ErrNotAuthenticated) {
+			s.gate.Lock()
+			s.setAuthRequiredLocked("Kite session expired during liquidation; reconnect to continue")
+			s.lockRecord.LiquidationState = "RETRYING"
+			s.gate.Unlock()
+			_ = s.store.UpdateLiquidation(ctx, "RETRYING", "Kite session expired during liquidation; reconnect to continue")
+			s.auditBestEffort(ctx, domain.AuditEvent{Type: "LIQUIDATION_AUTH_REQUIRED", Code: domain.CodeAuthRequired, Message: "Liquidation paused until Kite is reconnected."})
+			s.signal()
+			return err
 		}
 		if err != nil {
 			lastErr = err
@@ -919,13 +1034,16 @@ func (s *Service) liquidate(ctx context.Context) error {
 }
 
 func (s *Service) liquidationPass(ctx context.Context) (bool, error) {
+	s.gate.Lock()
+	intents := copyStringMap(s.forcedExits)
+	s.gate.Unlock()
 	orders, err := s.broker.Orders(ctx)
 	if err != nil {
 		return false, err
 	}
 	var passErr error
 	for _, order := range orders {
-		if domain.IsFNOExchange(order.Exchange) && order.Cancellable() && !isForcedExitOrder(order) {
+		if domain.IsFNOExchange(order.Exchange) && order.Cancellable() && !isForcedExitOrder(order, intents) {
 			if err := s.broker.Cancel(ctx, order.Variety, order.OrderID); err != nil {
 				passErr = errors.Join(passErr, fmt.Errorf("cancel %s: %w", order.OrderID, err))
 			} else {
@@ -937,17 +1055,21 @@ func (s *Service) liquidationPass(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, errors.Join(passErr, err)
 	}
-	activeExits := make(map[string]bool)
+	activeExits := make(map[string][]domain.Order)
+	seenIntents := make(map[string]bool)
 	for _, order := range orders {
-		if domain.IsFNOExchange(order.Exchange) && order.Cancellable() && !isForcedExitOrder(order) {
+		if domain.IsFNOExchange(order.Exchange) && order.Cancellable() && !isForcedExitOrder(order, intents) {
 			return false, passErr
 		}
 	}
 	for _, order := range orders {
-		if isForcedExitOrder(order) {
-			key := instrumentKey(order.Exchange, order.TradingSymbol) + "|" + order.Product
+		if isForcedExitOrder(order, intents) {
+			key := positionKeyFor(order.Exchange, order.TradingSymbol, order.Product)
+			if parentID, ok := intents[key]; ok && orderMatchesIntent(order, parentID) {
+				seenIntents[key] = true
+			}
 			if order.Cancellable() {
-				activeExits[key] = true
+				activeExits[key] = append(activeExits[key], order)
 			}
 		}
 	}
@@ -956,18 +1078,52 @@ func (s *Service) liquidationPass(ctx context.Context) (bool, error) {
 		return false, errors.Join(passErr, err)
 	}
 	open := 0
+	openKeys := make(map[string]bool)
+	for _, position := range positions {
+		if domain.IsFNOExchange(position.Exchange) && position.Quantity != 0 {
+			openKeys[positionKeyFor(position.Exchange, position.TradingSymbol, position.Product)] = true
+		}
+	}
+	for key, activeOrders := range activeExits {
+		if openKeys[key] {
+			continue
+		}
+		for _, order := range activeOrders {
+			if err := s.broker.Cancel(ctx, order.Variety, order.OrderID); err != nil {
+				passErr = errors.Join(passErr, fmt.Errorf("cancel orphan forced exit %s: %w", order.OrderID, err))
+			} else {
+				s.auditBestEffort(ctx, domain.AuditEvent{Type: "FORCED_EXIT_CANCEL", Code: domain.CodeApproved, Message: "Forced exit cancelled because its position was already flat.", OrderID: order.OrderID})
+			}
+		}
+	}
 	for _, position := range positions {
 		if !domain.IsFNOExchange(position.Exchange) || position.Quantity == 0 {
 			continue
 		}
 		open++
-		key := instrumentKey(position.Exchange, position.TradingSymbol) + "|" + position.Product
-		if activeExits[key] {
+		key := positionKeyFor(position.Exchange, position.TradingSymbol, position.Product)
+		if len(activeExits[key]) > 0 {
 			continue
 		}
+		if _, submitted := intents[key]; submitted && !seenIntents[key] {
+			passErr = errors.Join(passErr, fmt.Errorf("forced exit %s is not yet visible in the order book", intents[key]))
+			continue
+		}
+		if err := s.reserveForcedExitIntent(ctx, key); err != nil {
+			passErr = errors.Join(passErr, err)
+			continue
+		}
+		intents[key] = s.forcedExitIntent(key)
 		orderID, err := s.broker.ExitPosition(ctx, position)
 		if orderID != "" {
-			s.auditBestEffort(ctx, domain.AuditEvent{Type: "FORCED_EXIT", Code: domain.CodeApproved, Message: "Forced F&O position exit submitted.", OrderID: orderID, Metadata: map[string]any{"exchange": position.Exchange, "tradingsymbol": position.TradingSymbol}})
+			s.gate.Lock()
+			s.forcedExits[key] = orderID
+			s.gate.Unlock()
+			intents[key] = orderID
+			if persistErr := s.store.PutLiquidationIntent(ctx, domain.LiquidationIntent{PositionKey: key, OrderID: orderID, CreatedAt: s.now()}); persistErr != nil {
+				passErr = errors.Join(passErr, persistErr)
+			}
+			s.auditBestEffort(ctx, domain.AuditEvent{Type: "FORCED_EXIT", Code: domain.CodeApproved, Message: "Forced F&O position exit submitted.", OrderID: orderID, Metadata: map[string]any{"exchange": position.Exchange, "tradingsymbol": position.TradingSymbol, "product": position.Product}})
 		}
 		if err != nil {
 			passErr = errors.Join(passErr, fmt.Errorf("exit %s: %w", position.TradingSymbol, err))
@@ -977,12 +1133,39 @@ func (s *Service) liquidationPass(ctx context.Context) (bool, error) {
 	if open > 0 {
 		return false, passErr
 	}
+	for key, orderID := range intents {
+		if !seenIntents[key] {
+			passErr = errors.Join(passErr, fmt.Errorf("forced exit %s is not yet visible in the order book", orderID))
+		}
+	}
+	s.gate.Lock()
+	for key := range s.forcedExits {
+		if !openKeys[key] && len(activeExits[key]) == 0 && seenIntents[key] {
+			if err := s.store.DeleteLiquidationIntent(ctx, key); err != nil {
+				passErr = errors.Join(passErr, err)
+			} else {
+				delete(s.forcedExits, key)
+				delete(s.forcedExitAt, key)
+			}
+		}
+	}
+	s.gate.Unlock()
 	for _, order := range orders {
 		if domain.IsFNOExchange(order.Exchange) && order.Cancellable() {
 			return false, passErr
 		}
 	}
 	return passErr == nil, passErr
+}
+
+func intentOrderState(orders []domain.Order, parentID string) (found, active bool) {
+	for _, order := range orders {
+		if orderMatchesIntent(order, parentID) {
+			found = true
+			active = active || order.Cancellable()
+		}
+	}
+	return found, active
 }
 
 func (s *Service) MaybeUnlock(ctx context.Context) error {
@@ -1126,6 +1309,19 @@ func (s *Service) preTradeStateDecisionLocked() (domain.RiskDecision, bool) {
 	return domain.RiskDecision{}, false
 }
 
+func (s *Service) setAuthRequiredLocked(message string) {
+	s.authed = false
+	s.runtime = domain.RuntimeAuthRequired
+	s.lockRecord.LastError = message
+}
+
+func (s *Service) markAuthenticationRequired(message string) {
+	s.gate.Lock()
+	s.setAuthRequiredLocked(message)
+	s.gate.Unlock()
+	s.signal()
+}
+
 func (s *Service) approve(code domain.DecisionCode, message string) domain.RiskDecision {
 	return domain.RiskDecision{Allowed: true, Code: code, Message: message, EvaluatedMTM: s.mtm, TradingStatus: s.trading, Timestamp: s.now()}
 }
@@ -1209,7 +1405,17 @@ func (s *Service) validateOptionCoverageLocked(target domain.Instrument, targetP
 	}
 	quantities := make(map[positionKey]int)
 	for _, position := range positions {
-		quantities[positionKey{token: position.InstrumentToken, product: position.Product}] += position.Quantity
+		if !domain.IsFNOExchange(position.Exchange) || position.Quantity == 0 {
+			continue
+		}
+		instrument, ok := s.instrumentByTokenLocked(position.InstrumentToken)
+		if !ok {
+			instrument, ok = s.instruments[instrumentKey(position.Exchange, position.TradingSymbol)]
+		}
+		if !ok {
+			return fmt.Errorf("existing F&O position %s:%s has no current instrument metadata; option exposure cannot be verified", position.Exchange, position.TradingSymbol)
+		}
+		quantities[positionKey{token: instrument.Token, product: position.Product}] += position.Quantity
 	}
 	for _, order := range orders {
 		// A pending BUY is not protection: the new SELL could fill first. A
@@ -1221,10 +1427,13 @@ func (s *Service) validateOptionCoverageLocked(target domain.Instrument, targetP
 		if !ok {
 			instrument, ok = s.instruments[instrumentKey(order.Exchange, order.TradingSymbol)]
 		}
-		if !ok || !domain.IsOptionType(instrument.InstrumentType) {
+		if !ok {
+			return fmt.Errorf("pending SELL order %s has no current instrument metadata; option exposure cannot be verified", order.OrderID)
+		}
+		if !domain.IsOptionType(instrument.InstrumentType) {
 			continue
 		}
-		quantities[positionKey{token: instrument.Token, product: order.Product}] -= order.PendingQuantity
+		quantities[positionKey{token: instrument.Token, product: order.Product}] -= order.RemainingQuantity()
 	}
 	quantities[positionKey{token: target.Token, product: targetProduct}] += delta
 	longQty, shortQty := 0, 0
@@ -1248,7 +1457,17 @@ func (s *Service) validateOptionCoverageLocked(target domain.Instrument, targetP
 func (s *Service) validateBasketPortfolioCoverageLocked(validated risk.ValidatedBasket) error {
 	quantities := make(map[positionKey]int)
 	for _, position := range s.positions {
-		quantities[positionKey{token: position.InstrumentToken, product: position.Product}] += position.Quantity
+		if position.Quantity == 0 {
+			continue
+		}
+		instrument, ok := s.instrumentByTokenLocked(position.InstrumentToken)
+		if !ok {
+			instrument, ok = s.instruments[instrumentKey(position.Exchange, position.TradingSymbol)]
+		}
+		if !ok {
+			return fmt.Errorf("existing F&O position %s:%s has no current instrument metadata; basket exposure cannot be verified", position.Exchange, position.TradingSymbol)
+		}
+		quantities[positionKey{token: instrument.Token, product: position.Product}] += position.Quantity
 	}
 	for _, order := range s.orders {
 		// Only pending SELL quantity is included. Pending BUY quantity cannot
@@ -1260,10 +1479,13 @@ func (s *Service) validateBasketPortfolioCoverageLocked(validated risk.Validated
 		if !ok {
 			instrument, ok = s.instruments[instrumentKey(order.Exchange, order.TradingSymbol)]
 		}
-		if !ok || !domain.IsOptionType(instrument.InstrumentType) {
+		if !ok {
+			return fmt.Errorf("pending SELL order %s has no current instrument metadata; basket exposure cannot be verified", order.OrderID)
+		}
+		if !domain.IsOptionType(instrument.InstrumentType) {
 			continue
 		}
-		quantities[positionKey{token: instrument.Token, product: order.Product}] -= order.PendingQuantity
+		quantities[positionKey{token: instrument.Token, product: order.Product}] -= order.RemainingQuantity()
 	}
 	groups := make(map[string]optionGroup)
 	for _, leg := range validated.Request.Legs {
@@ -1397,7 +1619,7 @@ func portfolioFlat(positions []domain.Position, orders []domain.Order) bool {
 	return true
 }
 
-func isForcedExitOrder(order domain.Order) bool {
+func isForcedExitOrder(order domain.Order, intents map[string]string) bool {
 	if order.Tag == forcedExitTag {
 		return true
 	}
@@ -1406,7 +1628,100 @@ func isForcedExitOrder(order domain.Order) bool {
 			return true
 		}
 	}
+	for _, parentID := range intents {
+		if orderMatchesIntent(order, parentID) {
+			return true
+		}
+	}
 	return false
+}
+
+func orderHasTagPrefix(order domain.Order, prefix string) bool {
+	if strings.HasPrefix(order.Tag, prefix) {
+		return true
+	}
+	for _, tag := range order.Tags {
+		if strings.HasPrefix(tag, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func orderMatchesIntent(order domain.Order, parentID string) bool {
+	return parentID != "" && (order.OrderID == parentID || order.ParentOrderID == parentID)
+}
+
+func positionKeyFor(exchange, symbol, product string) string {
+	return instrumentKey(exchange, symbol) + "|" + strings.ToUpper(product)
+}
+
+func copyStringMap(source map[string]string) map[string]string {
+	result := make(map[string]string, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
+func (s *Service) reserveForcedExitIntent(ctx context.Context, key string) error {
+	reference, err := pendingReference("pending-exit:")
+	if err != nil {
+		return err
+	}
+	now := s.now()
+	if err := s.store.PutLiquidationIntent(ctx, domain.LiquidationIntent{PositionKey: key, OrderID: reference, CreatedAt: now}); err != nil {
+		return err
+	}
+	s.gate.Lock()
+	s.forcedExits[key] = reference
+	s.forcedExitAt[key] = now
+	s.gate.Unlock()
+	return nil
+}
+
+func (s *Service) reserveForcedExitIntentLocked(ctx context.Context, key string) error {
+	reference, err := pendingReference("pending-exit:")
+	if err != nil {
+		return err
+	}
+	now := s.now()
+	if err := s.store.PutLiquidationIntent(ctx, domain.LiquidationIntent{PositionKey: key, OrderID: reference, CreatedAt: now}); err != nil {
+		return err
+	}
+	s.forcedExits[key] = reference
+	s.forcedExitAt[key] = now
+	return nil
+}
+
+func (s *Service) persistForcedExitIntentLocked(ctx context.Context, key, orderID string) error {
+	createdAt := s.forcedExitAt[key]
+	if createdAt.IsZero() {
+		createdAt = s.now()
+		s.forcedExitAt[key] = createdAt
+	}
+	return s.store.PutLiquidationIntent(ctx, domain.LiquidationIntent{PositionKey: key, OrderID: orderID, CreatedAt: createdAt})
+}
+
+func (s *Service) forcedExitIntent(key string) string {
+	s.gate.Lock()
+	defer s.gate.Unlock()
+	return s.forcedExits[key]
+}
+
+func (s *Service) purgeExpiredExitIntentsLocked(ctx context.Context) error {
+	today := s.calendar.TradingDate(s.now())
+	for key, createdAt := range s.forcedExitAt {
+		if s.calendar.TradingDate(createdAt) == today {
+			continue
+		}
+		if err := s.store.DeleteLiquidationIntent(ctx, key); err != nil {
+			return err
+		}
+		delete(s.forcedExits, key)
+		delete(s.forcedExitAt, key)
+	}
+	return nil
 }
 
 func findOrder(orders []domain.Order, id string) (domain.Order, bool) {

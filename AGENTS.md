@@ -10,6 +10,7 @@
 - Cancellations are allowed while locked or degraded. Forced liquidation is an internal-only capability.
 - Never report liquidation complete until broker reconciliation confirms no pending NFO/BFO orders and no nonzero NFO/BFO positions.
 - Reserve idempotency durably before broker placement/modification. An uncertain broker response must never be retried automatically with the same key.
+- Reserve a durable, position-specific liquidation intent before every forced/explicit exit broker call. Never clear or replace an uncertain same-day intent without broker reconciliation; recognise autoslice children by parent order ID.
 
 ## Go practices
 
