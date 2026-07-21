@@ -1,0 +1,6 @@
+data/
+.env
+*.log
+.DS_Store
+coverage.out
+tradeguardian
