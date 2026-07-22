@@ -90,3 +90,14 @@ func TestDecodeJSONRejectsUnknownFieldsAndMultipleObjects(t *testing.T) {
 		}
 	}
 }
+
+func TestBroadcasterCloseIsIdempotent(t *testing.T) {
+	broadcast := newBroadcaster()
+	broadcast.close()
+	broadcast.close()
+	select {
+	case <-broadcast.done:
+	default:
+		t.Fatal("broadcaster close did not release live streams")
+	}
+}

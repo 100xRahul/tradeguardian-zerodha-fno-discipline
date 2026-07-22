@@ -3,6 +3,7 @@ module tradeguardian
 go 1.26
 
 require (
+	github.com/gorilla/websocket v1.5.3
 	github.com/zerodha/gokiteconnect/v4 v4.4.2
 	modernc.org/sqlite v1.39.1
 )

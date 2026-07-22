@@ -11,8 +11,8 @@ import (
 func TestValidateBasketBullCallSpread(t *testing.T) {
 	expiry := time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC)
 	instruments := map[string]domain.Instrument{
-		"NFO:NIFTY25000CE": {Exchange: "NFO", TradingSymbol: "NIFTY25000CE", Name: "NIFTY", InstrumentType: "CE", Expiry: expiry, Strike: 25_000, LotSize: 50},
-		"NFO:NIFTY25100CE": {Exchange: "NFO", TradingSymbol: "NIFTY25100CE", Name: "NIFTY", InstrumentType: "CE", Expiry: expiry, Strike: 25_100, LotSize: 50},
+		"NFO:NIFTY25000CE": {Token: 1, Exchange: "NFO", TradingSymbol: "NIFTY25000CE", Name: "NIFTY", InstrumentType: "CE", Expiry: expiry, Strike: 25_000, TickSize: 0.05, LotSize: 50},
+		"NFO:NIFTY25100CE": {Token: 2, Exchange: "NFO", TradingSymbol: "NIFTY25100CE", Name: "NIFTY", InstrumentType: "CE", Expiry: expiry, Strike: 25_100, TickSize: 0.05, LotSize: 50},
 	}
 	request := domain.BasketRequest{Legs: []domain.BasketLeg{
 		{Exchange: "NFO", TradingSymbol: "NIFTY25000CE", Product: "MIS", TransactionType: "BUY", Quantity: 50, LimitPrice: 100},
@@ -27,11 +27,44 @@ func TestValidateBasketBullCallSpread(t *testing.T) {
 	}
 }
 
+func TestValidateMarketBasketDoesNotRequireOrClaimLimitPrices(t *testing.T) {
+	expiry := time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC)
+	instruments := map[string]domain.Instrument{
+		"NFO:NIFTY25000CE": {Token: 1, Exchange: "NFO", TradingSymbol: "NIFTY25000CE", Name: "NIFTY", InstrumentType: "CE", Expiry: expiry, Strike: 25_000, TickSize: 0.05, LotSize: 50},
+		"NFO:NIFTY25100CE": {Token: 2, Exchange: "NFO", TradingSymbol: "NIFTY25100CE", Name: "NIFTY", InstrumentType: "CE", Expiry: expiry, Strike: 25_100, TickSize: 0.05, LotSize: 50},
+	}
+	validated, err := ValidateBasket(domain.BasketRequest{OrderType: "MARKET", Legs: []domain.BasketLeg{
+		{Exchange: "NFO", TradingSymbol: "NIFTY25000CE", Product: "MIS", TransactionType: "BUY", Quantity: 50},
+		{Exchange: "NFO", TradingSymbol: "NIFTY25100CE", Product: "MIS", TransactionType: "SELL", Quantity: 50},
+	}}, instruments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if validated.Request.OrderType != "MARKET" || validated.MaxLossPaise != 0 {
+		t.Fatalf("validated=%#v", validated)
+	}
+}
+
+func TestValidateMarketBasketRejectsClientPrice(t *testing.T) {
+	expiry := time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC)
+	instruments := map[string]domain.Instrument{
+		"NFO:NIFTY25000CE": {Token: 1, Exchange: "NFO", TradingSymbol: "NIFTY25000CE", Name: "NIFTY", InstrumentType: "CE", Expiry: expiry, Strike: 25_000, TickSize: 0.05, LotSize: 50},
+		"NFO:NIFTY25100CE": {Token: 2, Exchange: "NFO", TradingSymbol: "NIFTY25100CE", Name: "NIFTY", InstrumentType: "CE", Expiry: expiry, Strike: 25_100, TickSize: 0.05, LotSize: 50},
+	}
+	_, err := ValidateBasket(domain.BasketRequest{OrderType: "MARKET", Legs: []domain.BasketLeg{
+		{Exchange: "NFO", TradingSymbol: "NIFTY25000CE", Product: "MIS", TransactionType: "BUY", Quantity: 50, LimitPrice: 100},
+		{Exchange: "NFO", TradingSymbol: "NIFTY25100CE", Product: "MIS", TransactionType: "SELL", Quantity: 50},
+	}}, instruments)
+	if err == nil || !strings.Contains(err.Error(), "must not include") {
+		t.Fatalf("ValidateBasket() error=%v", err)
+	}
+}
+
 func TestValidateBasketRejectsMaximumLossOutsidePaiseRange(t *testing.T) {
 	expiry := time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC)
 	instruments := map[string]domain.Instrument{
-		"NFO:LOWCE":  {Exchange: "NFO", TradingSymbol: "LOWCE", Name: "NIFTY", InstrumentType: "CE", Expiry: expiry, Strike: 25_000, LotSize: 1},
-		"NFO:HIGHCE": {Exchange: "NFO", TradingSymbol: "HIGHCE", Name: "NIFTY", InstrumentType: "CE", Expiry: expiry, Strike: 25_100, LotSize: 1},
+		"NFO:LOWCE":  {Token: 1, Exchange: "NFO", TradingSymbol: "LOWCE", Name: "NIFTY", InstrumentType: "CE", Expiry: expiry, Strike: 25_000, TickSize: 0.05, LotSize: 1},
+		"NFO:HIGHCE": {Token: 2, Exchange: "NFO", TradingSymbol: "HIGHCE", Name: "NIFTY", InstrumentType: "CE", Expiry: expiry, Strike: 25_100, TickSize: 0.05, LotSize: 1},
 	}
 	request := domain.BasketRequest{Legs: []domain.BasketLeg{
 		{Exchange: "NFO", TradingSymbol: "LOWCE", Product: "MIS", TransactionType: "BUY", Quantity: 1_000_000_000, LimitPrice: 100_000_000},
@@ -45,8 +78,8 @@ func TestValidateBasketRejectsMaximumLossOutsidePaiseRange(t *testing.T) {
 func TestValidateBasketRejectsUnpairedOrRatioExposure(t *testing.T) {
 	expiry := time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC)
 	instruments := map[string]domain.Instrument{
-		"NFO:LOWCE":  {Exchange: "NFO", TradingSymbol: "LOWCE", Name: "NIFTY", InstrumentType: "CE", Expiry: expiry, Strike: 25_000, LotSize: 50},
-		"NFO:HIGHCE": {Exchange: "NFO", TradingSymbol: "HIGHCE", Name: "NIFTY", InstrumentType: "CE", Expiry: expiry, Strike: 25_100, LotSize: 50},
+		"NFO:LOWCE":  {Token: 1, Exchange: "NFO", TradingSymbol: "LOWCE", Name: "NIFTY", InstrumentType: "CE", Expiry: expiry, Strike: 25_000, TickSize: 0.05, LotSize: 50},
+		"NFO:HIGHCE": {Token: 2, Exchange: "NFO", TradingSymbol: "HIGHCE", Name: "NIFTY", InstrumentType: "CE", Expiry: expiry, Strike: 25_100, TickSize: 0.05, LotSize: 50},
 	}
 	request := domain.BasketRequest{Legs: []domain.BasketLeg{
 		{Exchange: "NFO", TradingSymbol: "LOWCE", Product: "MIS", TransactionType: "BUY", Quantity: 50, LimitPrice: 100},
@@ -60,8 +93,8 @@ func TestValidateBasketRejectsUnpairedOrRatioExposure(t *testing.T) {
 func TestValidateBasketRejectsMissingUnderlyingMetadata(t *testing.T) {
 	expiry := time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC)
 	instruments := map[string]domain.Instrument{
-		"NFO:LOWCE":  {Exchange: "NFO", TradingSymbol: "LOWCE", InstrumentType: "CE", Expiry: expiry, Strike: 25_000, LotSize: 50},
-		"NFO:HIGHCE": {Exchange: "NFO", TradingSymbol: "HIGHCE", InstrumentType: "CE", Expiry: expiry, Strike: 25_100, LotSize: 50},
+		"NFO:LOWCE":  {Token: 1, Exchange: "NFO", TradingSymbol: "LOWCE", InstrumentType: "CE", Expiry: expiry, Strike: 25_000, TickSize: 0.05, LotSize: 50},
+		"NFO:HIGHCE": {Token: 2, Exchange: "NFO", TradingSymbol: "HIGHCE", InstrumentType: "CE", Expiry: expiry, Strike: 25_100, TickSize: 0.05, LotSize: 50},
 	}
 	request := domain.BasketRequest{Legs: []domain.BasketLeg{
 		{Exchange: "NFO", TradingSymbol: "LOWCE", Product: "MIS", TransactionType: "BUY", Quantity: 50, LimitPrice: 100},
@@ -69,5 +102,20 @@ func TestValidateBasketRejectsMissingUnderlyingMetadata(t *testing.T) {
 	}}
 	if _, err := ValidateBasket(request, instruments); err == nil {
 		t.Fatal("ValidateBasket() error = nil for missing underlying metadata")
+	}
+}
+
+func TestValidateBasketRejectsMissingTickMetadata(t *testing.T) {
+	expiry := time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC)
+	instruments := map[string]domain.Instrument{
+		"NFO:LOWCE":  {Token: 1, Exchange: "NFO", TradingSymbol: "LOWCE", Name: "NIFTY", InstrumentType: "CE", Expiry: expiry, Strike: 25_000, LotSize: 50},
+		"NFO:HIGHCE": {Token: 2, Exchange: "NFO", TradingSymbol: "HIGHCE", Name: "NIFTY", InstrumentType: "CE", Expiry: expiry, Strike: 25_100, LotSize: 50},
+	}
+	request := domain.BasketRequest{Legs: []domain.BasketLeg{
+		{Exchange: "NFO", TradingSymbol: "LOWCE", Product: "MIS", TransactionType: "BUY", Quantity: 50, LimitPrice: 100},
+		{Exchange: "NFO", TradingSymbol: "HIGHCE", Product: "MIS", TransactionType: "SELL", Quantity: 50, LimitPrice: 50},
+	}}
+	if _, err := ValidateBasket(request, instruments); err == nil {
+		t.Fatal("ValidateBasket() error = nil for missing tick metadata")
 	}
 }

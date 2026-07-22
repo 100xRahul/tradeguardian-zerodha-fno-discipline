@@ -82,12 +82,19 @@ func (s *Server) Handler() http.Handler {
 	}))
 }
 
+// CloseLiveStreams asks long-lived dashboard streams to return before the HTTP
+// server begins graceful shutdown.
+func (s *Server) CloseLiveStreams() {
+	s.broadcast.close()
+}
+
 func (s *Server) routes() {
-	s.mux.HandleFunc("GET /", s.dashboard)
+	s.mux.HandleFunc("GET /", s.root)
 	s.mux.HandleFunc("GET /auth/login", s.login)
 	s.mux.HandleFunc("GET /auth/callback", s.callback)
 	s.mux.HandleFunc("GET /healthz", s.health)
 	s.mux.HandleFunc("GET /api/status", s.status)
+	s.mux.HandleFunc("GET /api/dashboard", s.dashboardState)
 	s.mux.HandleFunc("GET /api/positions", s.positions)
 	s.mux.HandleFunc("GET /api/orders", s.orders)
 	s.mux.HandleFunc("GET /api/instruments", s.instruments)
@@ -98,6 +105,10 @@ func (s *Server) routes() {
 	s.mux.Handle("POST /api/orders/{orderID}/modify", s.mutation(http.HandlerFunc(s.modify)))
 	s.mux.Handle("POST /api/orders/{orderID}/cancel", s.mutation(http.HandlerFunc(s.cancel)))
 	s.mux.Handle("POST /api/positions/{token}/exit", s.mutation(http.HandlerFunc(s.exitPosition)))
+}
+
+func (s *Server) root(w http.ResponseWriter, r *http.Request) {
+	s.dashboard(w, r)
 }
 
 func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
@@ -128,7 +139,7 @@ func (s *Server) callback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Kite login state validation failed. Start login again.", http.StatusBadRequest)
 		return
 	}
-	http.SetCookie(w, &http.Cookie{Name: "tg_auth_state", Value: "", Path: "/auth/callback", HttpOnly: true, Secure: s.secureCookie, MaxAge: -1})
+	http.SetCookie(w, &http.Cookie{Name: "tg_auth_state", Value: "", Path: "/auth/callback", HttpOnly: true, Secure: s.secureCookie, SameSite: http.SameSiteLaxMode, MaxAge: -1})
 	if r.URL.Query().Get("status") != "success" {
 		http.Error(w, "Kite login was not successful.", http.StatusBadRequest)
 		return
@@ -158,6 +169,10 @@ func (s *Server) status(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) positions(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"positions": s.service.Positions()})
+}
+
+func (s *Server) dashboardState(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, s.service.DashboardState())
 }
 
 func (s *Server) orders(w http.ResponseWriter, _ *http.Request) {
@@ -290,7 +305,7 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	updates, unsubscribe := s.broadcast.subscribe()
 	defer unsubscribe()
-	if _, err := io.WriteString(w, "event: state\ndata: refresh\n\n"); err != nil {
+	if err := s.writeDashboardEvent(w); err != nil {
 		return
 	}
 	flusher.Flush()
@@ -300,8 +315,10 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-s.broadcast.done:
+			return
 		case <-updates:
-			if _, err := io.WriteString(w, "event: state\ndata: refresh\n\n"); err != nil {
+			if err := s.writeDashboardEvent(w); err != nil {
 				return
 			}
 			flusher.Flush()
@@ -312,6 +329,17 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+func (s *Server) writeDashboardEvent(w io.Writer) error {
+	payload, err := json.Marshal(s.service.DashboardState())
+	if err != nil {
+		return fmt.Errorf("encode dashboard event: %w", err)
+	}
+	if _, err := fmt.Fprintf(w, "event: state\ndata: %s\n\n", payload); err != nil {
+		return fmt.Errorf("write dashboard event: %w", err)
+	}
+	return nil
 }
 
 func (s *Server) mutation(next http.Handler) http.Handler {
@@ -393,12 +421,16 @@ func securityHeaders(next http.Handler) http.Handler {
 }
 
 type broadcaster struct {
-	mu      sync.Mutex
-	nextID  int
-	clients map[int]chan struct{}
+	mu        sync.Mutex
+	nextID    int
+	clients   map[int]chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
-func newBroadcaster() *broadcaster { return &broadcaster{clients: make(map[int]chan struct{})} }
+func newBroadcaster() *broadcaster {
+	return &broadcaster{clients: make(map[int]chan struct{}), done: make(chan struct{})}
+}
 
 func (b *broadcaster) subscribe() (<-chan struct{}, func()) {
 	b.mu.Lock()
@@ -423,4 +455,8 @@ func (b *broadcaster) publish() {
 		default:
 		}
 	}
+}
+
+func (b *broadcaster) close() {
+	b.closeOnce.Do(func() { close(b.done) })
 }

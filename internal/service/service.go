@@ -19,35 +19,46 @@ import (
 )
 
 const (
-	forcedExitTag       = domain.ForcedExitTag
-	pendingOrderPrefix  = "pending-order:"
-	pendingModifyPrefix = "pending-modify:"
+	forcedExitTag         = domain.ForcedExitTag
+	pendingOrderPrefix    = "pending-order:"
+	pendingModifyPrefix   = "pending-modify:"
+	marketDataUnavailable = "live market data unavailable; loss monitoring cannot calculate current P&L"
 )
 
 type Service struct {
-	gate          sync.Mutex
-	operation     sync.Mutex
-	broker        domain.Broker
-	store         domain.StateStore
-	calendar      *calendar.Calendar
-	risk          *risk.Engine
-	now           func() time.Time
-	log           *log.Logger
-	notify        func()
-	trading       domain.TradingStatus
-	runtime       domain.RuntimeStatus
-	authed        bool
-	mtm           int64
-	lastUpdate    time.Time
-	positions     []domain.Position
-	orders        []domain.Order
-	instruments   map[string]domain.Instrument
-	lockRecord    domain.LockRecord
-	attention     map[string]int
-	forcedExits   map[string]string
-	forcedExitAt  map[string]time.Time
-	hardAttention bool
-	lockPersisted bool
+	gate             sync.Mutex
+	operation        sync.Mutex
+	broker           domain.Broker
+	store            domain.StateStore
+	calendar         *calendar.Calendar
+	risk             *risk.Engine
+	now              func() time.Time
+	lifecycleCtx     context.Context
+	log              *log.Logger
+	notify           func()
+	trading          domain.TradingStatus
+	runtime          domain.RuntimeStatus
+	authed           bool
+	mtm              int64
+	lastUpdate       time.Time
+	positions        []domain.Position
+	orders           []domain.Order
+	trades           []domain.Trade
+	instruments      map[string]domain.Instrument
+	instrumentSearch map[string][]string
+	liveTicks        map[uint32]domain.MarketTick
+	marketConnected  bool
+	marketRequired   bool
+	marketDataAt     time.Time
+	liveDirty        bool
+	reconcile        chan struct{}
+	sessionCache     domain.SessionCache
+	lockRecord       domain.LockRecord
+	attention        map[string]int
+	forcedExits      map[string]string
+	forcedExitAt     map[string]time.Time
+	hardAttention    bool
+	lockPersisted    bool
 }
 
 func New(ctx context.Context, broker domain.Broker, store domain.StateStore, cal *calendar.Calendar, logger *log.Logger, now func() time.Time) (*Service, error) {
@@ -65,11 +76,12 @@ func New(ctx context.Context, broker domain.Broker, store domain.StateStore, cal
 		return nil, err
 	}
 	service := &Service{
-		broker: broker, store: store, calendar: cal, risk: risk.New(now), now: now,
+		broker: broker, store: store, calendar: cal, risk: risk.New(now), now: now, lifecycleCtx: ctx,
 		log: logger, notify: func() {}, trading: record.Status, runtime: domain.RuntimeAuthRequired,
-		instruments: make(map[string]domain.Instrument), lockRecord: record,
+		instruments: make(map[string]domain.Instrument), instrumentSearch: make(map[string][]string), liveTicks: make(map[uint32]domain.MarketTick), reconcile: make(chan struct{}, 1), lockRecord: record,
 		attention: make(map[string]int), forcedExits: make(map[string]string), forcedExitAt: make(map[string]time.Time), lockPersisted: true,
 	}
+	_, service.marketRequired = broker.(domain.MarketStreamer)
 	if err := service.maybeUnlockLocked(ctx); err != nil {
 		return nil, err
 	}
@@ -96,12 +108,72 @@ func (s *Service) SetNotifier(notify func()) {
 	s.notify = notify
 }
 
+func (s *Service) SetSessionCache(cache domain.SessionCache) {
+	s.gate.Lock()
+	s.sessionCache = cache
+	s.gate.Unlock()
+}
+
 func (s *Service) LoginURL(state string) string { return s.broker.LoginURL(state) }
 
 func (s *Service) Authenticate(ctx context.Context, requestToken string) error {
-	if _, err := s.broker.GenerateSession(ctx, requestToken); err != nil {
+	session, err := s.broker.GenerateSession(ctx, requestToken)
+	if err != nil {
 		return err
 	}
+	if cache := s.currentSessionCache(); cache != nil {
+		if err := cache.Save(ctx, session, s.now()); err != nil {
+			s.gate.Lock()
+			s.setAuthRequiredLocked("Kite session could not be protected on disk; trading remains blocked")
+			s.gate.Unlock()
+			s.signal()
+			return fmt.Errorf("persist Kite session cache: %w", err)
+		}
+	}
+	if err := s.initializeAuthenticatedSession(ctx); err != nil {
+		if errors.Is(err, domain.ErrNotAuthenticated) {
+			return errors.Join(err, s.deleteCachedSession(context.WithoutCancel(ctx)))
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *Service) RestoreCachedSession(ctx context.Context) error {
+	cache := s.currentSessionCache()
+	if cache == nil {
+		return nil
+	}
+	session, err := cache.Load(ctx)
+	if errors.Is(err, domain.ErrNoCachedSession) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	restorer, ok := s.broker.(domain.SessionRestorer)
+	if !ok {
+		return fmt.Errorf("broker does not support cached Kite sessions")
+	}
+	if err := restorer.RestoreSession(ctx, session); err != nil {
+		return err
+	}
+	if err := s.initializeAuthenticatedSession(ctx); err != nil {
+		if errors.Is(err, domain.ErrNotAuthenticated) {
+			if deleteErr := s.deleteCachedSession(context.WithoutCancel(ctx)); deleteErr != nil {
+				return deleteErr
+			}
+			s.log.Printf("level=info message=%q", "discarded expired or rejected cached Kite session")
+			return nil
+		}
+		s.log.Printf("level=warn message=%q error=%q", "cached Kite session restored but initial broker validation is degraded", err)
+		return nil
+	}
+	s.log.Printf("level=info message=%q", "restored and validated cached Kite session")
+	return nil
+}
+
+func (s *Service) initializeAuthenticatedSession(ctx context.Context) error {
 	s.gate.Lock()
 	s.authed = true
 	s.runtime = domain.RuntimeDegraded
@@ -122,24 +194,69 @@ func (s *Service) Authenticate(ctx context.Context, requestToken string) error {
 	if err := s.PollOnce(ctx); err != nil {
 		return err
 	}
+	if streamer, ok := s.broker.(domain.MarketStreamer); ok {
+		if err := streamer.StartMarketStream(s.lifecycleCtx, s.marketTokens(), domain.MarketStreamCallbacks{
+			OnTick: s.applyMarketTick, OnOrderUpdate: s.requestReconciliation, OnStatus: s.setMarketStatus, OnError: s.marketStreamError,
+		}); err != nil {
+			s.log.Printf("level=warn message=%q error=%q", "Kite market stream could not start", err)
+		}
+	}
+	return nil
+}
+
+func (s *Service) currentSessionCache() domain.SessionCache {
+	s.gate.Lock()
+	defer s.gate.Unlock()
+	return s.sessionCache
+}
+
+func (s *Service) deleteCachedSession(ctx context.Context) error {
+	cache := s.currentSessionCache()
+	if cache == nil {
+		return nil
+	}
+	if err := cache.Delete(ctx); err != nil {
+		return fmt.Errorf("delete invalid Kite session cache: %w", err)
+	}
 	return nil
 }
 
 func (s *Service) refreshInstruments(ctx context.Context) error {
 	index := make(map[string]domain.Instrument)
+	search := make(map[string][]string)
+	tokens := make(map[uint32]string)
 	for _, exchange := range []string{"NFO", "BFO"} {
 		instruments, err := s.broker.Instruments(ctx, exchange)
 		if err != nil {
 			return err
 		}
 		for _, instrument := range instruments {
-			if instrument.Exchange == exchange {
-				index[instrumentKey(exchange, instrument.TradingSymbol)] = instrument
+			if instrument.Exchange != exchange || strings.TrimSpace(instrument.TradingSymbol) == "" {
+				return fmt.Errorf("%s instrument catalogue contains mismatched or empty identity metadata", exchange)
+			}
+			if instrument.InstrumentType != "FUT" && !domain.IsOptionType(instrument.InstrumentType) {
+				return fmt.Errorf("%s instrument %s has unsupported derivative type %q", exchange, instrument.TradingSymbol, instrument.InstrumentType)
+			}
+			if instrument.Token == 0 || instrument.LotSize <= 0 || instrument.TickSize <= 0 || math.IsNaN(instrument.TickSize) || math.IsInf(instrument.TickSize, 0) {
+				return fmt.Errorf("%s instrument %s has incomplete token, lot, or tick metadata", exchange, instrument.TradingSymbol)
+			}
+			key := instrumentKey(exchange, instrument.TradingSymbol)
+			if _, exists := index[key]; exists {
+				return fmt.Errorf("%s instrument catalogue contains duplicate symbol %s", exchange, instrument.TradingSymbol)
+			}
+			if existing, exists := tokens[instrument.Token]; exists {
+				return fmt.Errorf("instrument token %d is duplicated by %s and %s", instrument.Token, existing, key)
+			}
+			tokens[instrument.Token] = key
+			index[key] = instrument
+			for gram := range instrumentSearchGrams(instrument) {
+				search[searchIndexKey(exchange, gram)] = append(search[searchIndexKey(exchange, gram)], key)
 			}
 		}
 	}
 	s.gate.Lock()
 	s.instruments = index
+	s.instrumentSearch = search
 	s.gate.Unlock()
 	return nil
 }
@@ -147,6 +264,8 @@ func (s *Service) refreshInstruments(ctx context.Context) error {
 func (s *Service) Run(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	displayTicker := time.NewTicker(100 * time.Millisecond)
+	defer displayTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -155,8 +274,55 @@ func (s *Service) Run(ctx context.Context) {
 			if err := s.PollOnce(ctx); err != nil && !errors.Is(err, domain.ErrNotAuthenticated) && !errors.Is(err, context.Canceled) {
 				s.log.Printf("level=warn message=%q error=%q", "risk monitor poll failed", err)
 			}
+		case <-s.reconcile:
+			if err := s.PollOnce(ctx); err != nil && !errors.Is(err, domain.ErrNotAuthenticated) && !errors.Is(err, context.Canceled) {
+				s.log.Printf("level=warn message=%q error=%q", "order-update reconciliation failed", err)
+			}
+		case <-displayTicker.C:
+			s.gate.Lock()
+			dirty := s.liveDirty
+			s.liveDirty = false
+			s.gate.Unlock()
+			if dirty {
+				if err := s.evaluateLiveRisk(ctx); err != nil && !errors.Is(err, context.Canceled) {
+					s.log.Printf("level=error message=%q error=%q", "live loss evaluation failed", err)
+				}
+			}
 		}
 	}
+}
+
+// evaluateLiveRisk applies market-stream health transitions and provides a
+// second threshold check for the latest complete portfolio LTP state. The tick
+// callback itself also locks synchronously on a breach so a brief cross below
+// the limit cannot be lost when dashboard updates are coalesced.
+func (s *Service) evaluateLiveRisk(ctx context.Context) error {
+	s.gate.Lock()
+	if s.trading != domain.TradingActive {
+		s.gate.Unlock()
+		s.signal()
+		return nil
+	}
+
+	liveMTM, live := s.liveMTMLocked()
+	if live && liveMTM <= domain.LossLimitPaise {
+		s.enterDailyLossLockLocked(ctx, liveMTM)
+		s.gate.Unlock()
+		s.signal()
+		return s.liquidate(ctx)
+	}
+
+	marketReady := s.marketRiskReadyLocked()
+	if !marketReady && s.runtime == domain.RuntimeReady {
+		s.runtime = domain.RuntimeDegraded
+		s.lockRecord.LastError = marketDataUnavailable
+	} else if marketReady && s.runtime == domain.RuntimeDegraded && s.lockRecord.LastError == marketDataUnavailable {
+		s.runtime = domain.RuntimeReady
+		s.lockRecord.LastError = ""
+	}
+	s.gate.Unlock()
+	s.signal()
+	return nil
 }
 
 func (s *Service) PollOnce(ctx context.Context) error {
@@ -222,7 +388,7 @@ func (s *Service) PollOnce(ctx context.Context) error {
 		s.retryLockPersistenceLocked(ctx)
 	}
 	if s.trading == domain.TradingActive && s.mtm <= domain.LossLimitPaise {
-		s.enterDailyLossLockLocked(ctx)
+		s.enterDailyLossLockLocked(ctx, s.mtm)
 		s.gate.Unlock()
 		s.signal()
 		return errors.Join(intentCleanupErr, s.liquidate(ctx))
@@ -238,6 +404,33 @@ func (s *Service) PollOnce(ctx context.Context) error {
 		s.signal()
 		return intentCleanupErr
 	}
+	trades, tradeErr := s.broker.Trades(ctx)
+	if tradeErr != nil {
+		if errors.Is(tradeErr, domain.ErrNotAuthenticated) {
+			s.authed = false
+			s.runtime = domain.RuntimeAuthRequired
+			s.lockRecord.LastError = "Kite session expired; reconnect to resume monitoring"
+			s.gate.Unlock()
+			s.signal()
+			return tradeErr
+		}
+		locked := s.trading == domain.TradingLocked
+		if locked {
+			s.runtime = domain.RuntimeLiquidating
+			s.lockRecord.LastError = "trade monitoring unavailable during liquidation"
+		} else {
+			s.runtime = domain.RuntimeDegraded
+			s.lockRecord.LastError = "trade monitoring unavailable"
+		}
+		s.gate.Unlock()
+		s.auditBestEffort(ctx, domain.AuditEvent{Type: "MONITOR_ERROR", Code: domain.CodeMonitoringDegraded, Message: "Trade monitoring unavailable."})
+		s.signal()
+		if locked {
+			return s.liquidate(ctx)
+		}
+		return tradeErr
+	}
+	s.trades = append(s.trades[:0], trades...)
 	orders, orderErr := s.broker.Orders(ctx)
 	if orderErr != nil {
 		if errors.Is(orderErr, domain.ErrNotAuthenticated) {
@@ -281,13 +474,19 @@ func (s *Service) PollOnce(ctx context.Context) error {
 	s.reconcileAttentionLocked(orders)
 	shouldLiquidate := s.trading == domain.TradingLocked && s.lockRecord.LiquidationState != "COMPLETED"
 	if s.trading == domain.TradingActive && s.runtime != domain.RuntimeBasket && !s.hardAttention && len(s.attention) == 0 {
-		s.lockRecord.LastError = ""
-		s.runtime = domain.RuntimeReady
+		if s.marketRiskReadyLocked() {
+			s.lockRecord.LastError = ""
+			s.runtime = domain.RuntimeReady
+		} else {
+			s.lockRecord.LastError = marketDataUnavailable
+			s.runtime = domain.RuntimeDegraded
+		}
 	} else if s.trading == domain.TradingActive && (s.hardAttention || len(s.attention) > 0) {
 		s.runtime = domain.RuntimeDegraded
 		s.lockRecord.LastError = "basket rollback requires attention"
 	}
 	s.gate.Unlock()
+	s.syncMarketSubscriptions()
 	s.signal()
 	if shouldLiquidate {
 		return s.liquidate(ctx)
@@ -295,14 +494,14 @@ func (s *Service) PollOnce(ctx context.Context) error {
 	return nil
 }
 
-func (s *Service) enterDailyLossLockLocked(ctx context.Context) {
+func (s *Service) enterDailyLossLockLocked(ctx context.Context, triggerMTM int64) {
 	now := s.now()
 	record := domain.LockRecord{
 		Status: domain.TradingLocked, LockedOn: s.calendar.TradingDate(now),
-		TriggerMTMPaise: s.mtm, TriggeredAt: now, UnlockAt: s.calendar.NextUnlock(now),
+		TriggerMTMPaise: triggerMTM, TriggeredAt: now, UnlockAt: s.calendar.NextUnlock(now),
 		LiquidationState: "IN_PROGRESS",
 	}
-	event := domain.AuditEvent{CreatedAt: now, Type: "DAILY_LOSS_LOCK", Code: domain.CodeTradingLocked, Message: domain.LockMessage, Metadata: map[string]any{"mtm_paise": s.mtm}}
+	event := domain.AuditEvent{CreatedAt: now, Type: "DAILY_LOSS_LOCK", Code: domain.CodeTradingLocked, Message: domain.LockMessage, Metadata: map[string]any{"mtm_paise": triggerMTM}}
 	if persistErr := s.store.Lock(ctx, record, event); persistErr != nil {
 		s.log.Printf("level=error message=%q error=%q", "failed to persist daily loss lock; retaining in-memory lock", persistErr)
 		record.LastError = "lock persistence failed"
@@ -344,12 +543,12 @@ func (s *Service) Place(ctx context.Context, request domain.OrderRequest) (domai
 		s.auditDecision(ctx, "ORDER_REJECTED", decision, request, "")
 		return decision, "", nil
 	}
-	if instrument.LotSize <= 0 || (domain.IsOptionType(instrument.InstrumentType) && (strings.TrimSpace(instrument.Name) == "" || instrument.Expiry.IsZero() || instrument.Strike <= 0)) {
+	if !completeInstrumentMetadata(instrument) {
 		decision := s.reject(domain.CodeInvalidOrder, "Instrument metadata is incomplete; order blocked until the catalogue is refreshed.")
 		s.auditDecision(ctx, "ORDER_REJECTED", decision, request, "")
 		return decision, "", nil
 	}
-	decision := s.risk.Evaluate(request, s.trading, s.runtime, s.mtm)
+	decision := s.risk.Evaluate(request, s.trading, s.runtime, s.effectiveMTMLocked())
 	if !decision.Allowed {
 		s.auditDecision(ctx, "ORDER_REJECTED", decision, request, "")
 		return decision, "", nil
@@ -363,13 +562,6 @@ func (s *Service) Place(ctx context.Context, request domain.OrderRequest) (domai
 		decision = s.reject(domain.CodeInvalidOrder, fmt.Sprintf("Quantity must be a multiple of lot size %d.", instrument.LotSize))
 		s.auditDecision(ctx, "ORDER_REJECTED", decision, request, "")
 		return decision, "", nil
-	}
-	if domain.IsOptionType(instrument.InstrumentType) && request.TransactionType == "SELL" {
-		if err := s.validateOptionCoverageLocked(instrument, request.Product, -request.Quantity, nil, nil); err != nil {
-			decision = s.reject(domain.CodeUnhedgedExposure, err.Error())
-			s.auditDecision(ctx, "ORDER_REJECTED", decision, request, "")
-			return decision, "", nil
-		}
 	}
 	if !validIdempotencyKey(request.IdempotencyKey) {
 		decision = s.reject(domain.CodeInvalidOrder, "A valid idempotency key is required.")
@@ -402,7 +594,8 @@ func (s *Service) Place(ctx context.Context, request domain.OrderRequest) (domai
 	if err := s.store.CompleteIdempotency(ctx, request.IdempotencyKey, reference, orderID); err != nil {
 		s.log.Printf("level=error message=%q order_id=%q error=%q", "order placed but idempotency record failed", orderID, err)
 	}
-	s.cacheSubmittedOrderLocked(orderID, request, instrument.Token)
+	s.runtime = domain.RuntimeDegraded
+	s.lockRecord.LastError = "order submission is awaiting fresh Kite positions and orders"
 	s.auditDecision(ctx, "ORDER_SUBMITTED", decision, request, orderID)
 	s.signalAsync()
 	return decision, orderID, nil
@@ -441,18 +634,12 @@ func (s *Service) Modify(ctx context.Context, orderID string, request domain.Mod
 	if orderHasTagPrefix(current, "tgb") {
 		return s.reject(domain.CodeInvalidOrder, "Basket legs cannot be modified individually."), "", nil
 	}
-	instrument, ok := s.instruments[instrumentKey(current.Exchange, current.TradingSymbol)]
-	if !ok {
-		return s.reject(domain.CodeInvalidOrder, "Order instrument was not found in the current catalogue."), "", nil
+	instrument, ok := s.instrumentByTokenLocked(current.InstrumentToken)
+	if !ok || instrument.Exchange != current.Exchange || instrument.TradingSymbol != current.TradingSymbol {
+		return s.reject(domain.CodeInvalidOrder, "Order instrument token was not found in the current catalogue."), "", nil
 	}
-	if request.Quantity == 0 {
-		request.Quantity = current.Quantity
-	}
-	if request.OrderType == "" {
-		request.OrderType = current.OrderType
-	}
-	if request.Validity == "" {
-		request.Validity = current.Validity
+	if !completeInstrumentMetadata(instrument) {
+		return s.reject(domain.CodeInvalidOrder, "Instrument metadata is incomplete; modification blocked until the catalogue is refreshed."), "", nil
 	}
 	request.OrderType = strings.ToUpper(request.OrderType)
 	request.Validity = strings.ToUpper(request.Validity)
@@ -462,7 +649,7 @@ func (s *Service) Modify(ctx context.Context, orderID string, request domain.Mod
 		Validity: request.Validity, Quantity: request.Quantity, Price: request.Price,
 		TriggerPrice: request.TriggerPrice, InstrumentType: instrument.InstrumentType,
 	}
-	decision := s.risk.Evaluate(candidate, s.trading, s.runtime, s.mtm)
+	decision := s.risk.Evaluate(candidate, s.trading, s.runtime, s.effectiveMTMLocked())
 	if !decision.Allowed {
 		s.auditDecision(ctx, "MODIFY_REJECTED", decision, candidate, orderID)
 		return decision, "", nil
@@ -470,14 +657,11 @@ func (s *Service) Modify(ctx context.Context, orderID string, request domain.Mod
 	if err := validateOrderTicks(request.Price, request.TriggerPrice, instrument.TickSize); err != nil {
 		return s.reject(domain.CodeInvalidOrder, err.Error()), "", nil
 	}
+	if request.Quantity < current.FilledQuantity {
+		return s.reject(domain.CodeInvalidOrder, fmt.Sprintf("Quantity cannot be below the already filled quantity %d.", current.FilledQuantity)), "", nil
+	}
 	if instrument.LotSize > 0 && request.Quantity%instrument.LotSize != 0 {
 		return s.reject(domain.CodeInvalidOrder, fmt.Sprintf("Quantity must be a multiple of lot size %d.", instrument.LotSize)), "", nil
-	}
-	if domain.IsOptionType(instrument.InstrumentType) && current.TransactionType == "SELL" {
-		delta := -(request.Quantity - current.Quantity)
-		if err := s.validateOptionCoverageLocked(instrument, current.Product, delta, nil, orders); err != nil {
-			return s.reject(domain.CodeUnhedgedExposure, err.Error()), "", nil
-		}
 	}
 	reference, err := pendingReference(pendingModifyPrefix)
 	if err != nil {
@@ -504,7 +688,8 @@ func (s *Service) Modify(ctx context.Context, orderID string, request domain.Mod
 	if err := s.store.CompleteIdempotency(ctx, request.IdempotencyKey, reference, modifiedID); err != nil {
 		s.log.Printf("level=error message=%q order_id=%q error=%q", "modification submitted but idempotency record failed", modifiedID, err)
 	}
-	s.cacheModifiedOrderLocked(orderID, modifiedID, request, current)
+	s.runtime = domain.RuntimeDegraded
+	s.lockRecord.LastError = "order modification is awaiting fresh Kite positions and orders"
 	s.auditDecision(ctx, "ORDER_MODIFIED", decision, candidate, modifiedID)
 	s.signalAsync()
 	return decision, modifiedID, nil
@@ -570,11 +755,6 @@ func (s *Service) PlaceBasket(ctx context.Context, request domain.BasketRequest)
 		s.auditBestEffort(ctx, domain.AuditEvent{Type: "BASKET_REJECTED", Code: domain.CodeInvalidOrder, Message: err.Error()})
 		return domain.BasketResult{}, err
 	}
-	if err := s.validateBasketPortfolioCoverageLocked(validated); err != nil {
-		s.gate.Unlock()
-		s.auditBestEffort(ctx, domain.AuditEvent{Type: "BASKET_REJECTED", Code: domain.CodeUnhedgedExposure, Message: err.Error()})
-		return domain.BasketResult{}, err
-	}
 	basketID, err := RandomID()
 	if err != nil {
 		s.gate.Unlock()
@@ -587,7 +767,7 @@ func (s *Service) PlaceBasket(ctx context.Context, request domain.BasketRequest)
 	}
 	if !reserved {
 		s.gate.Unlock()
-		return domain.BasketResult{BasketID: existing, Status: "REPLAY", Message: "This basket request was already started.", MaxLossPaise: validated.MaxLossPaise}, nil
+		return domain.BasketResult{BasketID: existing, Status: "REPLAY", Message: "This basket request was already started.", MaxLossPaise: validated.MaxLossPaise, MaxLossKnown: validated.Request.OrderType == "LIMIT"}, nil
 	}
 	s.runtime = domain.RuntimeBasket
 	s.lockRecord.LastError = ""
@@ -596,11 +776,11 @@ func (s *Service) PlaceBasket(ctx context.Context, request domain.BasketRequest)
 
 	s.operation.Lock()
 	defer s.operation.Unlock()
-	result := domain.BasketResult{BasketID: basketID, Status: "DEPLOYING", Message: "Basket deployment started.", MaxLossPaise: validated.MaxLossPaise}
+	result := domain.BasketResult{BasketID: basketID, Status: "DEPLOYING", Message: "Basket deployment started.", MaxLossPaise: validated.MaxLossPaise, MaxLossKnown: validated.Request.OrderType == "LIMIT"}
 	tag := "tgb" + basketID[:12]
 	s.auditBestEffort(ctx, domain.AuditEvent{Type: "BASKET_STARTED", Code: domain.CodeApproved, Message: "Validated hedge basket deployment started.", Metadata: map[string]any{"basket_id": basketID, "max_loss_paise": validated.MaxLossPaise, "legs": len(validated.Request.Legs)}})
 
-	buyOrders, err := s.placeBasketPhase(ctx, validated.Request.Legs, "BUY", tag)
+	buyOrders, err := s.placeBasketPhase(ctx, validated.Request.Legs, validated.Request.OrderType, "BUY", tag)
 	result.OrderIDs = append(result.OrderIDs, phaseIDs(buyOrders)...)
 	if err != nil {
 		result.Status, result.Message = "ATTENTION_REQUIRED", "Protective BUY phase failed and final fills could not be assumed. Any confirmed long fills are retained until reconciliation."
@@ -636,7 +816,7 @@ func (s *Service) PlaceBasket(ctx context.Context, request domain.BasketRequest)
 		return result, err
 	}
 
-	sellOrders, err := s.placeBasketPhase(ctx, validated.Request.Legs, "SELL", tag)
+	sellOrders, err := s.placeBasketPhase(ctx, validated.Request.Legs, validated.Request.OrderType, "SELL", tag)
 	result.OrderIDs = append(result.OrderIDs, phaseIDs(sellOrders)...)
 	if err != nil {
 		result.Status, result.Message = "ATTENTION_REQUIRED", "SELL phase failed and final short fills could not be assumed. Protective long fills are retained until reconciliation."
@@ -676,7 +856,7 @@ type phaseOrder struct {
 	Filled  int
 }
 
-func (s *Service) placeBasketPhase(ctx context.Context, legs []domain.BasketLeg, side, tag string) ([]phaseOrder, error) {
+func (s *Service) placeBasketPhase(ctx context.Context, legs []domain.BasketLeg, orderType, side, tag string) ([]phaseOrder, error) {
 	orders := make([]phaseOrder, 0, len(legs))
 	for _, leg := range legs {
 		if leg.TransactionType != side {
@@ -684,7 +864,7 @@ func (s *Service) placeBasketPhase(ctx context.Context, legs []domain.BasketLeg,
 		}
 		orderID, err := s.placeBasketLeg(ctx, domain.OrderRequest{
 			Variety: "regular", Exchange: leg.Exchange, TradingSymbol: leg.TradingSymbol,
-			Product: leg.Product, OrderType: "LIMIT", TransactionType: side,
+			Product: leg.Product, OrderType: orderType, TransactionType: side,
 			Validity: "IOC", Quantity: leg.Quantity, Price: leg.LimitPrice, Tag: tag,
 		})
 		if err != nil {
@@ -939,10 +1119,9 @@ func (s *Service) ExitPosition(ctx context.Context, token uint32, product string
 				delete(s.forcedExits, key)
 				delete(s.forcedExitAt, key)
 			}
-			if instrument, ok := s.instrumentByTokenLocked(token); ok && domain.IsOptionType(instrument.InstrumentType) {
-				if err := s.validateOptionCoverageLocked(instrument, position.Product, -position.Quantity, positions, nil); err != nil {
-					return "", err
-				}
+			instrument, ok := s.instrumentByTokenLocked(token)
+			if !ok || instrument.Exchange != position.Exchange || instrument.TradingSymbol != position.TradingSymbol {
+				return "", fmt.Errorf("position instrument token was not found in the current catalogue; risk-reducing exit cannot be verified")
 			}
 			if err := s.reserveForcedExitIntentLocked(ctx, key); err != nil {
 				return "", err
@@ -1206,6 +1385,10 @@ func (s *Service) maybeUnlockLocked(ctx context.Context) error {
 func (s *Service) Snapshot() domain.Snapshot {
 	s.gate.Lock()
 	defer s.gate.Unlock()
+	return s.snapshotLocked()
+}
+
+func (s *Service) snapshotLocked() domain.Snapshot {
 	message := "Risk controls active."
 	if s.trading == domain.TradingLocked {
 		message = domain.LockedMessage
@@ -1230,13 +1413,279 @@ func (s *Service) Snapshot() domain.Snapshot {
 			pending++
 		}
 	}
-	return domain.Snapshot{
+	liveMTM, live := s.liveMTMLocked()
+	marketStatus := "DISCONNECTED"
+	if s.marketConnected {
+		marketStatus = "AWAITING_TICKS"
+		if live {
+			marketStatus = "LIVE"
+		}
+	}
+	snapshot := domain.Snapshot{
 		TradingStatus: s.trading, RuntimeStatus: s.runtime, Message: message,
 		MTMPaise: s.mtm, LossLimitPaise: domain.LossLimitPaise, LastRefresh: optionalTime(s.lastUpdate),
 		Authenticated: s.authed, Liquidation: s.lockRecord.LiquidationState,
 		LastError: s.lockRecord.LastError, NextUnlock: optionalTime(s.lockRecord.UnlockAt),
-		OpenPositionQty: openQty, PendingOrders: pending,
+		OpenPositionQty: openQty, PendingOrders: pending, MarketData: marketStatus,
 	}
+	if live {
+		snapshot.LiveMTMPaise = &liveMTM
+	}
+	if !s.marketDataAt.IsZero() {
+		snapshot.MarketDataAt = optionalTime(s.marketDataAt)
+	}
+	return snapshot
+}
+
+// DashboardState returns status, positions, and orders under one lock so an
+// SSE update can never mix data from different monitor cycles.
+func (s *Service) DashboardState() domain.DashboardState {
+	s.gate.Lock()
+	defer s.gate.Unlock()
+	return domain.DashboardState{
+		Status:    s.snapshotLocked(),
+		Positions: s.livePositionsLocked(),
+		Orders:    append(make([]domain.Order, 0, len(s.orders)), s.orders...),
+	}
+}
+
+func (s *Service) livePositionsLocked() []domain.Position {
+	positions := append(make([]domain.Position, 0, len(s.positions)), s.positions...)
+	_, positionMTM, live := s.livePortfolioMTMLocked()
+	if !live {
+		return positions
+	}
+	for index := range positions {
+		positions[index].M2M = positionMTM[positionKey{token: positions[index].InstrumentToken, product: positions[index].Product}]
+		if positions[index].Quantity != 0 {
+			positions[index].LastPrice = s.liveTicks[positions[index].InstrumentToken].LastPrice
+		}
+	}
+	return positions
+}
+
+func (s *Service) liveMTMLocked() (int64, bool) {
+	total, _, live := s.livePortfolioMTMLocked()
+	return total, live
+}
+
+type livePositionCalculation struct {
+	position    domain.Position
+	cashFlow    float64
+	expectedQty int64
+}
+
+func (s *Service) livePortfolioMTMLocked() (int64, map[positionKey]float64, bool) {
+	if !s.marketConnected {
+		return 0, nil, false
+	}
+	calculations := make(map[positionKey]*livePositionCalculation, len(s.positions))
+	positionMTM := make(map[positionKey]float64, len(s.positions))
+	for _, position := range s.positions {
+		if !validPositionM2MInputs(position) {
+			return 0, nil, false
+		}
+		key := positionKey{token: position.InstrumentToken, product: position.Product}
+		if _, duplicate := calculations[key]; duplicate {
+			return 0, nil, false
+		}
+		openingValue := float64(position.OvernightQty) * position.ClosePrice * position.Multiplier
+		if math.IsNaN(openingValue) || math.IsInf(openingValue, 0) {
+			return 0, nil, false
+		}
+		calculations[key] = &livePositionCalculation{
+			position: position, cashFlow: -openingValue, expectedQty: int64(position.OvernightQty),
+		}
+	}
+	tradeIDs := make(map[string]struct{}, len(s.trades))
+	for _, trade := range s.trades {
+		if _, duplicate := tradeIDs[trade.TradeID]; duplicate || trade.TradeID == "" || trade.Quantity <= 0 ||
+			trade.AveragePrice <= 0 || math.IsNaN(trade.AveragePrice) || math.IsInf(trade.AveragePrice, 0) {
+			return 0, nil, false
+		}
+		tradeIDs[trade.TradeID] = struct{}{}
+		key := positionKey{token: trade.InstrumentToken, product: trade.Product}
+		calculation, ok := calculations[key]
+		if !ok || calculation.position.Exchange != trade.Exchange || calculation.position.TradingSymbol != trade.TradingSymbol {
+			return 0, nil, false
+		}
+		quantity := int64(trade.Quantity)
+		value := float64(trade.Quantity) * trade.AveragePrice * calculation.position.Multiplier
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return 0, nil, false
+		}
+		switch trade.TransactionType {
+		case "BUY":
+			if calculation.expectedQty > math.MaxInt64-quantity {
+				return 0, nil, false
+			}
+			calculation.expectedQty += quantity
+			calculation.cashFlow -= value
+		case "SELL":
+			if calculation.expectedQty < math.MinInt64+quantity {
+				return 0, nil, false
+			}
+			calculation.expectedQty -= quantity
+			calculation.cashFlow += value
+		default:
+			return 0, nil, false
+		}
+		if math.IsNaN(calculation.cashFlow) || math.IsInf(calculation.cashFlow, 0) {
+			return 0, nil, false
+		}
+	}
+	var total float64
+	for key, calculation := range calculations {
+		position := calculation.position
+		if calculation.expectedQty != int64(position.Quantity) {
+			return 0, nil, false
+		}
+		m2m := calculation.cashFlow
+		if position.Quantity != 0 {
+			tick, ok := s.liveTicks[position.InstrumentToken]
+			if !ok || !validMarketTick(tick) {
+				return 0, nil, false
+			}
+			m2m += float64(position.Quantity) * tick.LastPrice * position.Multiplier
+		}
+		if math.IsNaN(m2m) || math.IsInf(m2m, 0) {
+			return 0, nil, false
+		}
+		positionMTM[key] = m2m
+		total += m2m
+		if math.IsNaN(total) || math.IsInf(total, 0) {
+			return 0, nil, false
+		}
+	}
+	paise := math.Round(total * 100)
+	if paise < math.MinInt64 || paise > math.MaxInt64 {
+		return 0, nil, false
+	}
+	return int64(paise), positionMTM, true
+}
+
+func validPositionM2MInputs(position domain.Position) bool {
+	return position.Multiplier > 0 && !math.IsNaN(position.Multiplier) && !math.IsInf(position.Multiplier, 0) &&
+		position.ClosePrice >= 0 && !math.IsNaN(position.ClosePrice) && !math.IsInf(position.ClosePrice, 0) &&
+		(position.OvernightQty == 0 || position.ClosePrice > 0) &&
+		position.LastPrice >= 0 && !math.IsNaN(position.LastPrice) && !math.IsInf(position.LastPrice, 0) &&
+		!math.IsNaN(position.BuyM2M) && !math.IsInf(position.BuyM2M, 0) &&
+		!math.IsNaN(position.SellM2M) && !math.IsInf(position.SellM2M, 0)
+}
+
+func validMarketTick(tick domain.MarketTick) bool {
+	return tick.LastPrice >= 0 && !math.IsNaN(tick.LastPrice) && !math.IsInf(tick.LastPrice, 0) && !tick.ReceivedAt.IsZero()
+}
+
+func (s *Service) marketRiskReadyLocked() bool {
+	if !s.marketRequired {
+		return true
+	}
+	if !s.marketConnected {
+		return false
+	}
+	if !hasOpenPositions(s.positions) {
+		return true
+	}
+	_, live := s.liveMTMLocked()
+	return live
+}
+
+func (s *Service) effectiveMTMLocked() int64 {
+	if liveMTM, live := s.liveMTMLocked(); live {
+		return liveMTM
+	}
+	return s.mtm
+}
+
+func (s *Service) marketTokens() []uint32 {
+	s.gate.Lock()
+	defer s.gate.Unlock()
+	seen := make(map[uint32]struct{})
+	for _, position := range s.positions {
+		if position.Quantity != 0 && position.InstrumentToken != 0 {
+			seen[position.InstrumentToken] = struct{}{}
+		}
+	}
+	tokens := make([]uint32, 0, len(seen))
+	for token := range seen {
+		tokens = append(tokens, token)
+	}
+	sort.Slice(tokens, func(i, j int) bool { return tokens[i] < tokens[j] })
+	return tokens
+}
+
+func (s *Service) syncMarketSubscriptions() {
+	streamer, ok := s.broker.(domain.MarketStreamer)
+	if !ok {
+		return
+	}
+	if err := streamer.SetMarketSubscriptions(s.marketTokens()); err != nil {
+		s.setMarketStatus(false)
+		s.log.Printf("level=warn message=%q error=%q", "Kite market subscriptions could not be updated", err)
+	}
+}
+
+func (s *Service) applyMarketTick(tick domain.MarketTick) {
+	if tick.InstrumentToken == 0 || !validMarketTick(tick) {
+		return
+	}
+	s.gate.Lock()
+	tracked := false
+	for _, position := range s.positions {
+		if position.Quantity != 0 && position.InstrumentToken == tick.InstrumentToken {
+			tracked = true
+			break
+		}
+	}
+	if tracked {
+		s.liveTicks[tick.InstrumentToken] = tick
+		s.marketDataAt = tick.ReceivedAt
+		s.liveDirty = true
+	}
+	shouldLiquidate := false
+	if tracked && s.trading == domain.TradingActive {
+		if liveMTM, live := s.liveMTMLocked(); live && liveMTM <= domain.LossLimitPaise {
+			s.enterDailyLossLockLocked(s.lifecycleCtx, liveMTM)
+			shouldLiquidate = true
+		}
+	}
+	s.gate.Unlock()
+	if shouldLiquidate {
+		s.signal()
+		go func() {
+			if err := s.liquidate(s.lifecycleCtx); err != nil && !errors.Is(err, context.Canceled) {
+				s.log.Printf("level=error message=%q error=%q", "live loss liquidation failed", err)
+			}
+		}()
+	}
+}
+
+func (s *Service) setMarketStatus(connected bool) {
+	s.gate.Lock()
+	s.marketConnected = connected
+	if !connected {
+		s.liveTicks = make(map[uint32]domain.MarketTick)
+	}
+	s.liveDirty = true
+	if s.trading == domain.TradingActive && s.runtime == domain.RuntimeReady && !s.marketRiskReadyLocked() {
+		s.runtime = domain.RuntimeDegraded
+		s.lockRecord.LastError = marketDataUnavailable
+	}
+	s.gate.Unlock()
+	s.signal()
+}
+
+func (s *Service) requestReconciliation() {
+	select {
+	case s.reconcile <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Service) marketStreamError(message string) {
+	s.log.Printf("level=warn message=%q error=%q", "Kite market stream error", message)
+	s.setMarketStatus(false)
 }
 
 func (s *Service) Positions() []domain.Position {
@@ -1252,8 +1701,6 @@ func (s *Service) Orders() []domain.Order {
 }
 
 func (s *Service) SearchInstruments(query, exchange, kind string, limit int) []domain.Instrument {
-	s.gate.Lock()
-	defer s.gate.Unlock()
 	query = strings.ToUpper(strings.TrimSpace(query))
 	exchange = strings.ToUpper(strings.TrimSpace(exchange))
 	kind = strings.ToUpper(strings.TrimSpace(kind))
@@ -1266,11 +1713,28 @@ func (s *Service) SearchInstruments(query, exchange, kind string, limit int) []d
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}
+	s.gate.Lock()
+	instruments := s.instruments
+	var candidates []string
+	if len(query) >= 2 {
+		candidates = s.instrumentSearch[searchIndexKey(exchange, query[:2])]
+	}
+	s.gate.Unlock()
+
 	result := make([]domain.Instrument, 0, limit)
-	for _, instrument := range s.instruments {
-		kindMatches := kind == "" || (kind == "OPTION" && (instrument.InstrumentType == "CE" || instrument.InstrumentType == "PE")) || (kind == "FUTURE" && instrument.InstrumentType == "FUT")
+	appendMatch := func(instrument domain.Instrument) {
+		kindMatches := kind == "" || (kind == "OPTION" && domain.IsOptionType(instrument.InstrumentType)) || (kind == "FUTURE" && instrument.InstrumentType == "FUT")
 		if instrument.Exchange == exchange && kindMatches && (query == "" || strings.Contains(strings.ToUpper(instrument.TradingSymbol), query) || strings.Contains(strings.ToUpper(instrument.Name), query)) {
 			result = append(result, instrument)
+		}
+	}
+	if len(query) >= 2 {
+		for _, key := range candidates {
+			appendMatch(instruments[key])
+		}
+	} else {
+		for _, instrument := range instruments {
+			appendMatch(instrument)
 		}
 	}
 	sort.Slice(result, func(i, j int) bool {
@@ -1285,12 +1749,27 @@ func (s *Service) SearchInstruments(query, exchange, kind string, limit int) []d
 	return result
 }
 
+func instrumentSearchGrams(instrument domain.Instrument) map[string]struct{} {
+	grams := make(map[string]struct{})
+	for _, value := range []string{instrument.TradingSymbol, instrument.Name} {
+		value = strings.ToUpper(strings.TrimSpace(value))
+		for index := 0; index+2 <= len(value); index++ {
+			grams[value[index:index+2]] = struct{}{}
+		}
+	}
+	return grams
+}
+
+func searchIndexKey(exchange, gram string) string {
+	return exchange + "\x00" + gram
+}
+
 func (s *Service) Audit(ctx context.Context, limit int) ([]domain.AuditEvent, error) {
 	return s.store.ListAudit(ctx, limit)
 }
 
 func (s *Service) reject(code domain.DecisionCode, message string) domain.RiskDecision {
-	return domain.RiskDecision{Allowed: false, Code: code, Message: message, EvaluatedMTM: s.mtm, TradingStatus: s.trading, Timestamp: s.now()}
+	return domain.RiskDecision{Allowed: false, Code: code, Message: message, EvaluatedMTM: s.effectiveMTMLocked(), TradingStatus: s.trading, Timestamp: s.now()}
 }
 
 func (s *Service) preTradeStateDecisionLocked() (domain.RiskDecision, bool) {
@@ -1323,7 +1802,7 @@ func (s *Service) markAuthenticationRequired(message string) {
 }
 
 func (s *Service) approve(code domain.DecisionCode, message string) domain.RiskDecision {
-	return domain.RiskDecision{Allowed: true, Code: code, Message: message, EvaluatedMTM: s.mtm, TradingStatus: s.trading, Timestamp: s.now()}
+	return domain.RiskDecision{Allowed: true, Code: code, Message: message, EvaluatedMTM: s.effectiveMTMLocked(), TradingStatus: s.trading, Timestamp: s.now()}
 }
 
 func (s *Service) auditDecision(ctx context.Context, kind string, decision domain.RiskDecision, request domain.OrderRequest, orderID string) {
@@ -1346,44 +1825,10 @@ func (s *Service) auditBestEffort(ctx context.Context, event domain.AuditEvent) 
 
 func (s *Service) decorateOrdersLocked() {
 	for index := range s.orders {
-		if instrument, ok := s.instruments[instrumentKey(s.orders[index].Exchange, s.orders[index].TradingSymbol)]; ok {
+		if instrument, ok := s.instrumentByTokenLocked(s.orders[index].InstrumentToken); ok {
 			s.orders[index].InstrumentType = instrument.InstrumentType
 		}
 	}
-}
-
-func (s *Service) cacheSubmittedOrderLocked(orderID string, request domain.OrderRequest, instrumentToken uint32) {
-	s.orders = append(s.orders, domain.Order{
-		OrderID: orderID, Variety: request.Variety, Status: "SUBMITTED", Exchange: request.Exchange,
-		TradingSymbol: request.TradingSymbol, InstrumentToken: instrumentToken, InstrumentType: request.InstrumentType,
-		Product: request.Product, OrderType: request.OrderType, TransactionType: request.TransactionType,
-		Validity: request.Validity, Quantity: request.Quantity, PendingQuantity: request.Quantity,
-		Price: request.Price, TriggerPrice: request.TriggerPrice, Tag: request.Tag,
-	})
-}
-
-func (s *Service) cacheModifiedOrderLocked(originalID, modifiedID string, request domain.ModifyRequest, current domain.Order) {
-	updated := current
-	if modifiedID != "" {
-		updated.OrderID = modifiedID
-	}
-	updated.Quantity = request.Quantity
-	updated.PendingQuantity = request.Quantity - current.FilledQuantity
-	if updated.PendingQuantity < 0 {
-		updated.PendingQuantity = 0
-	}
-	updated.OrderType = request.OrderType
-	updated.Validity = request.Validity
-	updated.Price = request.Price
-	updated.TriggerPrice = request.TriggerPrice
-	updated.Status = "SUBMITTED"
-	for index := range s.orders {
-		if s.orders[index].OrderID == originalID {
-			s.orders[index] = updated
-			return
-		}
-	}
-	s.orders = append(s.orders, updated)
 }
 
 type positionKey struct {
@@ -1391,141 +1836,9 @@ type positionKey struct {
 	product string
 }
 
-type optionGroup struct {
-	instrument domain.Instrument
-	product    string
-}
-
-func (s *Service) validateOptionCoverageLocked(target domain.Instrument, targetProduct string, delta int, positions []domain.Position, orders []domain.Order) error {
-	if positions == nil {
-		positions = s.positions
-	}
-	if orders == nil {
-		orders = s.orders
-	}
-	quantities := make(map[positionKey]int)
-	for _, position := range positions {
-		if !domain.IsFNOExchange(position.Exchange) || position.Quantity == 0 {
-			continue
-		}
-		instrument, ok := s.instrumentByTokenLocked(position.InstrumentToken)
-		if !ok {
-			instrument, ok = s.instruments[instrumentKey(position.Exchange, position.TradingSymbol)]
-		}
-		if !ok {
-			return fmt.Errorf("existing F&O position %s:%s has no current instrument metadata; option exposure cannot be verified", position.Exchange, position.TradingSymbol)
-		}
-		quantities[positionKey{token: instrument.Token, product: position.Product}] += position.Quantity
-	}
-	for _, order := range orders {
-		// A pending BUY is not protection: the new SELL could fill first. A
-		// pending SELL is counted as exposure because it may fill at any time.
-		if !order.Cancellable() || order.TransactionType != "SELL" {
-			continue
-		}
-		instrument, ok := s.instrumentByTokenLocked(order.InstrumentToken)
-		if !ok {
-			instrument, ok = s.instruments[instrumentKey(order.Exchange, order.TradingSymbol)]
-		}
-		if !ok {
-			return fmt.Errorf("pending SELL order %s has no current instrument metadata; option exposure cannot be verified", order.OrderID)
-		}
-		if !domain.IsOptionType(instrument.InstrumentType) {
-			continue
-		}
-		quantities[positionKey{token: instrument.Token, product: order.Product}] -= order.RemainingQuantity()
-	}
-	quantities[positionKey{token: target.Token, product: targetProduct}] += delta
-	longQty, shortQty := 0, 0
-	for key, quantity := range quantities {
-		instrument, ok := s.instrumentByTokenLocked(key.token)
-		if !ok || key.product != targetProduct || instrument.Exchange != target.Exchange || instrument.Name != target.Name || !instrument.Expiry.Equal(target.Expiry) || instrument.InstrumentType != target.InstrumentType {
-			continue
-		}
-		if quantity > 0 {
-			longQty += quantity
-		} else {
-			shortQty -= quantity
-		}
-	}
-	if shortQty > longQty {
-		return fmt.Errorf("resulting %s exposure would have %d unprotected short quantity; use a validated hedge basket", target.InstrumentType, shortQty-longQty)
-	}
-	return nil
-}
-
-func (s *Service) validateBasketPortfolioCoverageLocked(validated risk.ValidatedBasket) error {
-	quantities := make(map[positionKey]int)
-	for _, position := range s.positions {
-		if position.Quantity == 0 {
-			continue
-		}
-		instrument, ok := s.instrumentByTokenLocked(position.InstrumentToken)
-		if !ok {
-			instrument, ok = s.instruments[instrumentKey(position.Exchange, position.TradingSymbol)]
-		}
-		if !ok {
-			return fmt.Errorf("existing F&O position %s:%s has no current instrument metadata; basket exposure cannot be verified", position.Exchange, position.TradingSymbol)
-		}
-		quantities[positionKey{token: instrument.Token, product: position.Product}] += position.Quantity
-	}
-	for _, order := range s.orders {
-		// Only pending SELL quantity is included. Pending BUY quantity cannot
-		// safely cover a short until the broker reports its fill in positions.
-		if !order.Cancellable() || order.TransactionType != "SELL" {
-			continue
-		}
-		instrument, ok := s.instrumentByTokenLocked(order.InstrumentToken)
-		if !ok {
-			instrument, ok = s.instruments[instrumentKey(order.Exchange, order.TradingSymbol)]
-		}
-		if !ok {
-			return fmt.Errorf("pending SELL order %s has no current instrument metadata; basket exposure cannot be verified", order.OrderID)
-		}
-		if !domain.IsOptionType(instrument.InstrumentType) {
-			continue
-		}
-		quantities[positionKey{token: instrument.Token, product: order.Product}] -= order.RemainingQuantity()
-	}
-	groups := make(map[string]optionGroup)
-	for _, leg := range validated.Request.Legs {
-		instrument := validated.Instruments[instrumentKey(leg.Exchange, leg.TradingSymbol)]
-		delta := leg.Quantity
-		if leg.TransactionType == "SELL" {
-			delta = -delta
-		}
-		key := positionKey{token: instrument.Token, product: leg.Product}
-		quantities[key] += delta
-		group := optionGroup{instrument: instrument, product: leg.Product}
-		groups[optionGroupKey(instrument, leg.Product)] = group
-	}
-	for _, target := range groups {
-		longQty, shortQty := 0, 0
-		for key, quantity := range quantities {
-			instrument, ok := s.instrumentByTokenLocked(key.token)
-			if !ok || optionGroupKey(instrument, key.product) != optionGroupKey(target.instrument, target.product) {
-				continue
-			}
-			if quantity > 0 {
-				longQty += quantity
-			} else {
-				shortQty -= quantity
-			}
-		}
-		if shortQty > longQty {
-			return fmt.Errorf("resulting portfolio would retain %d uncovered %s quantity for %s %s %s; basket rejected", shortQty-longQty, target.instrument.InstrumentType, target.instrument.Name, target.instrument.Expiry.Format("2006-01-02"), target.product)
-		}
-	}
-	return nil
-}
-
-func optionGroupKey(instrument domain.Instrument, product string) string {
-	return instrument.Exchange + "|" + instrument.Name + "|" + instrument.Expiry.UTC().Format(time.RFC3339Nano) + "|" + instrument.InstrumentType + "|" + product
-}
-
 func validateOrderTicks(price, trigger, tick float64) error {
-	if tick <= 0 {
-		return nil
+	if tick <= 0 || math.IsNaN(tick) || math.IsInf(tick, 0) {
+		return fmt.Errorf("instrument tick size is unavailable or invalid; order blocked until the catalogue is refreshed")
 	}
 	for name, value := range map[string]float64{"price": price, "trigger price": trigger} {
 		if value <= 0 {
@@ -1537,6 +1850,16 @@ func validateOrderTicks(price, trigger, tick float64) error {
 		}
 	}
 	return nil
+}
+
+func completeInstrumentMetadata(instrument domain.Instrument) bool {
+	if instrument.Token == 0 || instrument.LotSize <= 0 || instrument.TickSize <= 0 || math.IsNaN(instrument.TickSize) || math.IsInf(instrument.TickSize, 0) {
+		return false
+	}
+	if !domain.IsOptionType(instrument.InstrumentType) {
+		return true
+	}
+	return strings.TrimSpace(instrument.Name) != "" && !instrument.Expiry.IsZero() && instrument.Strike > 0 && !math.IsNaN(instrument.Strike) && !math.IsInf(instrument.Strike, 0)
 }
 
 func (s *Service) instrumentByTokenLocked(token uint32) (domain.Instrument, bool) {
@@ -1593,6 +1916,15 @@ func filterPositions(all []domain.Position) []domain.Position {
 		}
 	}
 	return result
+}
+
+func hasOpenPositions(positions []domain.Position) bool {
+	for _, position := range positions {
+		if position.Quantity != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func filterOrders(all []domain.Order) []domain.Order {

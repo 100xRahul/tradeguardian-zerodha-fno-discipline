@@ -38,8 +38,8 @@ func TestOptionBuyRejectedAndFutureBuyPlaced(t *testing.T) {
 		t.Fatalf("future result decision=%#v orderID=%q calls=%d error=%v", decision, orderID, broker.placeCalls, err)
 	}
 	decision, replayID, err := app.Place(ctx, future)
-	if err != nil || decision.Code != domain.CodeIdempotentReplay || replayID != orderID || broker.placeCalls != 1 {
-		t.Fatalf("replay result decision=%#v orderID=%q calls=%d error=%v", decision, replayID, broker.placeCalls, err)
+	if err != nil || decision.Code != domain.CodeMonitoringDegraded || replayID != "" || broker.placeCalls != 1 {
+		t.Fatalf("pre-reconciliation replay decision=%#v orderID=%q calls=%d error=%v", decision, replayID, broker.placeCalls, err)
 	}
 }
 
@@ -47,7 +47,7 @@ func TestInstrumentSearchFiltersExchangeAndContractKind(t *testing.T) {
 	app, broker, _ := newTestService(t, 0)
 	broker.instruments = append(broker.instruments, domain.Instrument{
 		Token: 4, Exchange: "BFO", TradingSymbol: "SENSEX26JUL80000CE", Name: "SENSEX",
-		InstrumentType: "CE", Expiry: time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC), Strike: 80_000, LotSize: 20,
+		InstrumentType: "CE", Expiry: time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC), Strike: 80_000, TickSize: 0.05, LotSize: 20,
 	})
 	if err := app.Authenticate(context.Background(), "request"); err != nil {
 		t.Fatal(err)
@@ -70,6 +70,262 @@ func TestInstrumentSearchFiltersExchangeAndContractKind(t *testing.T) {
 	}
 }
 
+func TestAuthenticationPersistsAndRestartRestoresSameDaySession(t *testing.T) {
+	app, broker, _ := newTestService(t, 0)
+	cache := &fakeSessionCache{}
+	app.SetSessionCache(cache)
+	if err := app.Authenticate(context.Background(), "request"); err != nil {
+		t.Fatal(err)
+	}
+	if cache.saved.AccessToken != "not-persisted" || cache.savedAt.IsZero() {
+		t.Fatalf("saved session=%#v at=%v", cache.saved, cache.savedAt)
+	}
+
+	restored, restoredBroker, _ := newTestService(t, 0)
+	restoredCache := &fakeSessionCache{loaded: cache.saved}
+	restored.SetSessionCache(restoredCache)
+	if err := restored.RestoreCachedSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if restoredBroker.restoreCalls != 1 || !restored.Snapshot().Authenticated || restored.Snapshot().RuntimeStatus != domain.RuntimeReady {
+		t.Fatalf("restoreCalls=%d snapshot=%#v", restoredBroker.restoreCalls, restored.Snapshot())
+	}
+	if broker.restoreCalls != 0 {
+		t.Fatalf("fresh authentication unexpectedly restored a token: %d", broker.restoreCalls)
+	}
+}
+
+func TestRejectedCachedSessionIsDeletedAndStartsAuthRequired(t *testing.T) {
+	app, broker, _ := newTestService(t, 0)
+	broker.positionsErr = domain.ErrNotAuthenticated
+	cache := &fakeSessionCache{loaded: domain.Session{UserID: "test", AccessToken: "expired"}}
+	app.SetSessionCache(cache)
+	if err := app.RestoreCachedSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if cache.deleteCalls != 1 || app.Snapshot().RuntimeStatus != domain.RuntimeAuthRequired || app.Snapshot().Authenticated {
+		t.Fatalf("deleteCalls=%d snapshot=%#v", cache.deleteCalls, app.Snapshot())
+	}
+}
+
+func TestCachedSessionNetworkFailureStartsDegradedAndRetriesLater(t *testing.T) {
+	app, broker, _ := newTestService(t, 0)
+	broker.positionsErr = errors.New("temporary network failure")
+	cache := &fakeSessionCache{loaded: domain.Session{UserID: "test", AccessToken: "same-day-token"}}
+	app.SetSessionCache(cache)
+	if err := app.RestoreCachedSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if cache.deleteCalls != 0 || !app.Snapshot().Authenticated || app.Snapshot().RuntimeStatus != domain.RuntimeDegraded {
+		t.Fatalf("deleteCalls=%d snapshot=%#v", cache.deleteCalls, app.Snapshot())
+	}
+}
+
+func TestDashboardStateContainsOneMonitorSnapshot(t *testing.T) {
+	app, broker, _ := newTestService(t, 0)
+	broker.positions = []domain.Position{{Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", InstrumentToken: 1, Product: "MIS", Quantity: 50, M2M: 125.25}}
+	broker.orders = []domain.Order{{OrderID: "order-1", Variety: "regular", Status: "OPEN", Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", InstrumentToken: 1, Product: "MIS", TransactionType: "SELL", Quantity: 50, PendingQuantity: 50}}
+	if err := app.Authenticate(context.Background(), "request"); err != nil {
+		t.Fatal(err)
+	}
+
+	state := app.DashboardState()
+	if state.Status.RuntimeStatus != domain.RuntimeReady || state.Status.MTMPaise != 12_525 {
+		t.Fatalf("status = %#v", state.Status)
+	}
+	if len(state.Positions) != 1 || state.Positions[0].TradingSymbol != "NIFTY26JULFUT" {
+		t.Fatalf("positions = %#v", state.Positions)
+	}
+	if len(state.Orders) != 1 || state.Orders[0].OrderID != "order-1" || state.Status.PendingOrders != 1 {
+		t.Fatalf("orders = %#v, pending = %d", state.Orders, state.Status.PendingOrders)
+	}
+}
+
+func TestDashboardAppliesLiveTicksWithoutChangingConfirmedRiskMTM(t *testing.T) {
+	app, broker, _ := newTestService(t, 0)
+	broker.positions = []domain.Position{{
+		Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", InstrumentToken: 1, Product: "MIS",
+		Quantity: 50, Multiplier: 1, BuyM2M: 10_100, LastPrice: 200, M2M: -100,
+	}}
+	broker.trades = []domain.Trade{{TradeID: "trade-1", OrderID: "order-1", Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", InstrumentToken: 1, Product: "MIS", TransactionType: "BUY", Quantity: 50, AveragePrice: 202}}
+	if err := app.Authenticate(context.Background(), "request"); err != nil {
+		t.Fatal(err)
+	}
+	app.setMarketStatus(true)
+	tickTime := app.now().Add(time.Second)
+	app.applyMarketTick(domain.MarketTick{InstrumentToken: 1, LastPrice: 199, ReceivedAt: tickTime})
+
+	state := app.DashboardState()
+	if state.Status.MTMPaise != -10_000 {
+		t.Fatalf("confirmed MTM = %d, want -10000", state.Status.MTMPaise)
+	}
+	if state.Status.LiveMTMPaise == nil || *state.Status.LiveMTMPaise != -15_000 {
+		t.Fatalf("live MTM = %v, want -15000", state.Status.LiveMTMPaise)
+	}
+	if state.Status.MarketData != "LIVE" || state.Status.MarketDataAt == nil || !state.Status.MarketDataAt.Equal(tickTime) {
+		t.Fatalf("market status = %#v", state.Status)
+	}
+	if len(state.Positions) != 1 || state.Positions[0].LastPrice != 199 || state.Positions[0].M2M != -150 {
+		t.Fatalf("live positions = %#v", state.Positions)
+	}
+
+	app.setMarketStatus(false)
+	disconnected := app.DashboardState()
+	if disconnected.Status.LiveMTMPaise != nil || disconnected.Status.MarketData != "DISCONNECTED" || disconnected.Positions[0].LastPrice != 200 {
+		t.Fatalf("disconnected dashboard = %#v", disconnected)
+	}
+}
+
+func TestDashboardRetainsLatestStreamLTPAcrossPositionPolls(t *testing.T) {
+	app, broker, _ := newTestService(t, 0)
+	broker.positions = []domain.Position{{
+		Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", InstrumentToken: 1, Product: "MIS",
+		Quantity: 50, Multiplier: 1, BuyM2M: 10_100, LastPrice: 200, M2M: -100,
+	}}
+	broker.trades = []domain.Trade{{TradeID: "trade-1", OrderID: "order-1", Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", InstrumentToken: 1, Product: "MIS", TransactionType: "BUY", Quantity: 50, AveragePrice: 202}}
+	if err := app.Authenticate(context.Background(), "request"); err != nil {
+		t.Fatal(err)
+	}
+	app.setMarketStatus(true)
+	app.applyMarketTick(domain.MarketTick{InstrumentToken: 1, LastPrice: 199, ReceivedAt: app.now().Add(-time.Second)})
+
+	state := app.DashboardState()
+	if state.Status.LiveMTMPaise == nil || *state.Status.LiveMTMPaise != -15_000 || state.Status.MarketData != "LIVE" || state.Positions[0].LastPrice != 199 {
+		t.Fatalf("latest streamed LTP was discarded after a position poll: %#v", state)
+	}
+}
+
+func TestPaidMarketStreamIsRequiredBeforeNewExposure(t *testing.T) {
+	app, _, _ := newTestService(t, 0)
+	if err := app.Authenticate(context.Background(), "request"); err != nil {
+		t.Fatal(err)
+	}
+	app.gate.Lock()
+	app.marketRequired = true
+	app.gate.Unlock()
+	app.setMarketStatus(false)
+
+	decision, _, err := app.Place(context.Background(), validRequest("NIFTY26JULFUT", "BUY", 50))
+	if err != nil || decision.Code != domain.CodeMonitoringDegraded || decision.Allowed {
+		t.Fatalf("decision=%#v error=%v", decision, err)
+	}
+	if snapshot := app.Snapshot(); snapshot.RuntimeStatus != domain.RuntimeDegraded || snapshot.MarketData != "DISCONNECTED" {
+		t.Fatalf("snapshot=%#v", snapshot)
+	}
+}
+
+func TestOpenPositionRequiresCompleteLiveTicks(t *testing.T) {
+	app, broker, _ := newTestService(t, 0)
+	broker.positions = []domain.Position{{
+		Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", InstrumentToken: 1, Product: "MIS",
+		Quantity: 50, Multiplier: 1, BuyM2M: 10_100, LastPrice: 200, M2M: -100,
+	}}
+	broker.trades = []domain.Trade{{TradeID: "trade-1", OrderID: "order-1", Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", InstrumentToken: 1, Product: "MIS", TransactionType: "BUY", Quantity: 50, AveragePrice: 202}}
+	if err := app.Authenticate(context.Background(), "request"); err != nil {
+		t.Fatal(err)
+	}
+	app.gate.Lock()
+	app.marketRequired = true
+	app.gate.Unlock()
+	app.setMarketStatus(true)
+	if err := app.evaluateLiveRisk(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot := app.Snapshot(); snapshot.RuntimeStatus != domain.RuntimeDegraded || snapshot.MarketData != "AWAITING_TICKS" {
+		t.Fatalf("snapshot before tick=%#v", snapshot)
+	}
+
+	app.applyMarketTick(domain.MarketTick{InstrumentToken: 1, LastPrice: 199, ReceivedAt: app.now()})
+	if err := app.evaluateLiveRisk(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot := app.Snapshot(); snapshot.RuntimeStatus != domain.RuntimeReady || snapshot.LiveMTMPaise == nil || *snapshot.LiveMTMPaise != -15_000 {
+		t.Fatalf("snapshot after tick=%#v", snapshot)
+	}
+}
+
+func TestLiveTickAtDailyLossLimitLocksImmediately(t *testing.T) {
+	app, broker, store := newTestService(t, 0)
+	broker.positions = []domain.Position{{
+		Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", InstrumentToken: 1, Product: "MIS",
+		Quantity: 50, Multiplier: 1, BuyM2M: 35_000, LastPrice: 110, M2M: -29_500,
+	}}
+	broker.trades = []domain.Trade{{TradeID: "trade-1", OrderID: "order-1", Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", InstrumentToken: 1, Product: "MIS", TransactionType: "BUY", Quantity: 50, AveragePrice: 700}}
+	if err := app.Authenticate(context.Background(), "request"); err != nil {
+		t.Fatal(err)
+	}
+	app.gate.Lock()
+	app.marketRequired = true
+	app.gate.Unlock()
+	app.setMarketStatus(true)
+	app.applyMarketTick(domain.MarketTick{InstrumentToken: 1, LastPrice: 100, ReceivedAt: app.now()})
+
+	snapshot := app.Snapshot()
+	if snapshot.TradingStatus != domain.TradingLocked || store.record.TriggerMTMPaise != domain.LossLimitPaise {
+		t.Fatalf("snapshot=%#v lock=%#v", snapshot, store.record)
+	}
+}
+
+func TestLiveMTMUsesTradesForFlatRealizedPositions(t *testing.T) {
+	app, broker, _ := newTestService(t, 0)
+	broker.positions = []domain.Position{
+		{Exchange: "NFO", TradingSymbol: "NIFTY26JUL24100PE", InstrumentToken: 1, Product: "NRML", Multiplier: 1, M2M: -2_000, BuyM2M: 3_000, SellM2M: 1_000},
+		{Exchange: "NFO", TradingSymbol: "NIFTY26JUL24100CE", InstrumentToken: 2, Product: "NRML", Quantity: -10, Multiplier: 1, LastPrice: 102, M2M: 68},
+	}
+	broker.trades = []domain.Trade{
+		{TradeID: "flat-buy", OrderID: "order-1", Exchange: "NFO", TradingSymbol: "NIFTY26JUL24100PE", InstrumentToken: 1, Product: "NRML", TransactionType: "BUY", Quantity: 100, AveragePrice: 240},
+		{TradeID: "flat-sell", OrderID: "order-2", Exchange: "NFO", TradingSymbol: "NIFTY26JUL24100PE", InstrumentToken: 1, Product: "NRML", TransactionType: "SELL", Quantity: 100, AveragePrice: 230},
+		{TradeID: "open-sell", OrderID: "order-3", Exchange: "NFO", TradingSymbol: "NIFTY26JUL24100CE", InstrumentToken: 2, Product: "NRML", TransactionType: "SELL", Quantity: 10, AveragePrice: 110},
+	}
+	if err := app.Authenticate(context.Background(), "request"); err != nil {
+		t.Fatal(err)
+	}
+	app.setMarketStatus(true)
+	app.applyMarketTick(domain.MarketTick{InstrumentToken: 2, LastPrice: 102, ReceivedAt: app.now()})
+
+	state := app.DashboardState()
+	if state.Status.LiveMTMPaise == nil || *state.Status.LiveMTMPaise != -92_000 {
+		t.Fatalf("state=%#v, want live MTM -92000 paise", state)
+	}
+	if len(state.Positions) != 2 || state.Positions[0].M2M != -1_000 || state.Positions[1].M2M != 80 {
+		t.Fatalf("trade-priced positions=%#v", state.Positions)
+	}
+}
+
+func TestLiveMTMIncludesOvernightOpeningMarkAndTodayTrades(t *testing.T) {
+	app, broker, _ := newTestService(t, 0)
+	broker.positions = []domain.Position{{
+		Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", InstrumentToken: 1, Product: "NRML",
+		Quantity: -5, OvernightQty: -10, Multiplier: 1, ClosePrice: 100, LastPrice: 90, M2M: 150,
+	}}
+	broker.trades = []domain.Trade{{TradeID: "cover", OrderID: "order-1", Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", InstrumentToken: 1, Product: "NRML", TransactionType: "BUY", Quantity: 5, AveragePrice: 80}}
+	if err := app.Authenticate(context.Background(), "request"); err != nil {
+		t.Fatal(err)
+	}
+	app.setMarketStatus(true)
+	app.applyMarketTick(domain.MarketTick{InstrumentToken: 1, LastPrice: 90, ReceivedAt: app.now()})
+	if snapshot := app.Snapshot(); snapshot.LiveMTMPaise == nil || *snapshot.LiveMTMPaise != 15_000 {
+		t.Fatalf("snapshot=%#v", snapshot)
+	}
+}
+
+func TestTradePositionMismatchFailsClosed(t *testing.T) {
+	app, broker, _ := newTestService(t, 0)
+	broker.positions = []domain.Position{{Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", InstrumentToken: 1, Product: "MIS", Quantity: 50, Multiplier: 1, LastPrice: 200, M2M: 0}}
+	broker.trades = []domain.Trade{{TradeID: "wrong-quantity", OrderID: "order-1", Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", InstrumentToken: 1, Product: "MIS", TransactionType: "BUY", Quantity: 49, AveragePrice: 200}}
+	if err := app.Authenticate(context.Background(), "request"); err != nil {
+		t.Fatal(err)
+	}
+	app.gate.Lock()
+	app.marketRequired = true
+	app.gate.Unlock()
+	app.setMarketStatus(true)
+	app.applyMarketTick(domain.MarketTick{InstrumentToken: 1, LastPrice: 200, ReceivedAt: app.now()})
+	if snapshot := app.Snapshot(); snapshot.RuntimeStatus != domain.RuntimeDegraded || snapshot.LiveMTMPaise != nil {
+		t.Fatalf("inconsistent tradebook did not fail closed: %#v", snapshot)
+	}
+}
+
 func TestOrderPriceMustMatchInstrumentTickSize(t *testing.T) {
 	app, broker, _ := newTestService(t, 0)
 	broker.instruments[0].TickSize = 0.05
@@ -85,42 +341,41 @@ func TestOrderPriceMustMatchInstrumentTickSize(t *testing.T) {
 	}
 }
 
-func TestStandaloneUncoveredOptionSellRejected(t *testing.T) {
+func TestOrderBlockedWhenKiteTickSizeIsUnavailable(t *testing.T) {
+	app, broker, _ := newTestService(t, 0)
+	broker.instruments[0].TickSize = 0
+	if err := app.Authenticate(context.Background(), "request"); err == nil {
+		t.Fatal("Authenticate() error = nil for invalid catalogue tick size")
+	}
+	if snapshot := app.Snapshot(); snapshot.RuntimeStatus != domain.RuntimeDegraded || broker.placeCalls != 0 {
+		t.Fatalf("snapshot=%#v calls=%d", snapshot, broker.placeCalls)
+	}
+}
+
+func TestStandaloneNakedOptionSellAllowed(t *testing.T) {
 	app, broker, _ := newTestService(t, 0)
 	if err := app.Authenticate(context.Background(), "request"); err != nil {
 		t.Fatal(err)
 	}
 	request := validRequest("NIFTY26JUL25000CE", "SELL", 50)
 	decision, _, err := app.Place(context.Background(), request)
-	if err != nil || decision.Code != domain.CodeUnhedgedExposure || decision.Allowed {
+	if err != nil || decision.Code != domain.CodeApproved || !decision.Allowed {
 		t.Fatalf("decision = %#v, error = %v", decision, err)
 	}
-	if broker.placeCalls != 0 {
+	if broker.placeCalls != 1 {
 		t.Fatalf("broker Place called %d times", broker.placeCalls)
 	}
 }
 
-func TestPendingOrdersIncludedInOptionCoverage(t *testing.T) {
+func TestPendingSellDoesNotRequireLongOptionCoverage(t *testing.T) {
 	app, broker, _ := newTestService(t, 0)
-	broker.positions = []domain.Position{{Exchange: "NFO", TradingSymbol: "NIFTY26JUL25000CE", InstrumentToken: 2, Product: "MIS", Quantity: 50}}
-	broker.orders = []domain.Order{{OrderID: "sell-1", Variety: "regular", Status: "OPEN", Exchange: "NFO", TradingSymbol: "NIFTY26JUL25000CE", InstrumentToken: 2, Product: "MIS", TransactionType: "SELL", PendingQuantity: 50}}
+	broker.orders = []domain.Order{{OrderID: "sell-1", Variety: "regular", Status: "OPEN", Exchange: "NFO", TradingSymbol: "NIFTY26JUL25000CE", InstrumentToken: 2, Product: "MIS", TransactionType: "SELL", Quantity: 50, PendingQuantity: 50}}
 	if err := app.Authenticate(context.Background(), "request"); err != nil {
 		t.Fatal(err)
 	}
-	decision, _, err := app.Place(context.Background(), validRequest("NIFTY26JUL25000CE", "SELL", 50))
-	if err != nil || decision.Code != domain.CodeUnhedgedExposure {
-		t.Fatalf("decision = %#v, error = %v", decision, err)
-	}
-}
-
-func TestPendingBuyDoesNotCountAsOptionProtection(t *testing.T) {
-	app, broker, _ := newTestService(t, 0)
-	broker.orders = []domain.Order{{OrderID: "buy-1", Variety: "regular", Status: "OPEN", Exchange: "NFO", TradingSymbol: "NIFTY26JUL25000CE", InstrumentToken: 2, Product: "MIS", TransactionType: "BUY", PendingQuantity: 50}}
-	if err := app.Authenticate(context.Background(), "request"); err != nil {
-		t.Fatal(err)
-	}
-	decision, _, err := app.Place(context.Background(), validRequest("NIFTY26JUL25000CE", "SELL", 50))
-	if err != nil || decision.Code != domain.CodeUnhedgedExposure || decision.Allowed {
+	request := validRequest("NIFTY26JUL25000CE", "SELL", 50)
+	decision, _, err := app.Place(context.Background(), request)
+	if err != nil || !decision.Allowed || broker.placeCalls != 1 {
 		t.Fatalf("decision = %#v, error = %v", decision, err)
 	}
 }
@@ -138,37 +393,8 @@ func TestRapidSellOrdersCannotReuseTheSameLongCoverage(t *testing.T) {
 	second := validRequest("NIFTY26JUL25000CE", "SELL", 50)
 	second.IdempotencyKey = "second-sell-key-123"
 	decision, _, err := app.Place(context.Background(), second)
-	if err != nil || decision.Code != domain.CodeUnhedgedExposure || decision.Allowed || broker.placeCalls != 1 {
+	if err != nil || decision.Code != domain.CodeMonitoringDegraded || decision.Allowed || broker.placeCalls != 1 {
 		t.Fatalf("second decision=%#v calls=%d error=%v", decision, broker.placeCalls, err)
-	}
-}
-
-func TestOptionProtectionMustUseSameProduct(t *testing.T) {
-	app, broker, _ := newTestService(t, 0)
-	broker.positions = []domain.Position{{Exchange: "NFO", TradingSymbol: "NIFTY26JUL25000CE", InstrumentToken: 2, Product: "MIS", Quantity: 50}}
-	if err := app.Authenticate(context.Background(), "request"); err != nil {
-		t.Fatal(err)
-	}
-	request := validRequest("NIFTY26JUL25000CE", "SELL", 50)
-	request.Product = "NRML"
-	decision, _, err := app.Place(context.Background(), request)
-	if err != nil || decision.Code != domain.CodeUnhedgedExposure || decision.Allowed {
-		t.Fatalf("decision = %#v, error = %v", decision, err)
-	}
-}
-
-func TestOptionCoverageFailsClosedWhenExistingPositionMetadataIsMissing(t *testing.T) {
-	app, broker, _ := newTestService(t, 0)
-	broker.positions = []domain.Position{
-		{Exchange: "NFO", TradingSymbol: "NIFTY26JUL25000CE", InstrumentToken: 2, Product: "MIS", Quantity: 50},
-		{Exchange: "NFO", TradingSymbol: "UNKNOWN", InstrumentToken: 999, Product: "MIS", Quantity: 1},
-	}
-	if err := app.Authenticate(context.Background(), "request"); err != nil {
-		t.Fatal(err)
-	}
-	decision, _, err := app.Place(context.Background(), validRequest("NIFTY26JUL25000CE", "SELL", 50))
-	if err != nil || decision.Code != domain.CodeUnhedgedExposure || decision.Allowed || broker.placeCalls != 0 {
-		t.Fatalf("decision=%#v calls=%d error=%v", decision, broker.placeCalls, err)
 	}
 }
 
@@ -198,6 +424,17 @@ func TestExplicitPositionExitMatchesInstrumentAndProduct(t *testing.T) {
 	}
 	if len(broker.exitedProducts) != 1 || broker.exitedProducts[0] != "NRML" || broker.positions[0].Quantity != 50 || broker.positions[1].Quantity != 0 {
 		t.Fatalf("exited=%v positions=%#v", broker.exitedProducts, broker.positions)
+	}
+}
+
+func TestExplicitPositionExitRequiresExactInstrumentTokenMetadata(t *testing.T) {
+	app, broker, _ := newTestService(t, 0)
+	broker.positions = []domain.Position{{Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", InstrumentToken: 999, Product: "MIS", Quantity: 50}}
+	if err := app.Authenticate(context.Background(), "request"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.ExitPosition(context.Background(), 999, "MIS"); err == nil || broker.exitCalls != 0 {
+		t.Fatalf("exitCalls=%d error=%v", broker.exitCalls, err)
 	}
 }
 
@@ -468,21 +705,48 @@ func TestBasketRollbackNeverRemovesLongProtectionWhenShortCloseFails(t *testing.
 	}
 }
 
-func TestBasketRejectsResultingUncoveredPortfolio(t *testing.T) {
+func TestBasketAllowsExistingNakedShortPortfolio(t *testing.T) {
 	app, broker, _ := newTestService(t, 0)
 	broker.positions = []domain.Position{{Exchange: "NFO", TradingSymbol: "NIFTY26JUL25100CE", InstrumentToken: 3, Product: "MIS", Quantity: -50}}
 	if err := app.Authenticate(context.Background(), "request"); err != nil {
 		t.Fatal(err)
 	}
-	_, err := app.PlaceBasket(context.Background(), domain.BasketRequest{
+	result, err := app.PlaceBasket(context.Background(), domain.BasketRequest{
 		IdempotencyKey: "basket-portfolio-123", Name: "would remain uncovered",
 		Legs: []domain.BasketLeg{
 			{Exchange: "NFO", TradingSymbol: "NIFTY26JUL25000CE", Product: "MIS", TransactionType: "BUY", Quantity: 50, LimitPrice: 100},
 			{Exchange: "NFO", TradingSymbol: "NIFTY26JUL25100CE", Product: "MIS", TransactionType: "SELL", Quantity: 50, LimitPrice: 50},
 		},
 	})
-	if err == nil || broker.placeCalls != 0 {
-		t.Fatalf("basket error=%v placeCalls=%d", err, broker.placeCalls)
+	if err != nil || result.Status != "COMPLETE" || broker.placeCalls != 2 {
+		t.Fatalf("result=%#v error=%v placeCalls=%d", result, err, broker.placeCalls)
+	}
+}
+
+func TestMarketBasketUsesProtectedMarketIOCAndDoesNotClaimPlannedLoss(t *testing.T) {
+	app, broker, _ := newTestService(t, 0)
+	if err := app.Authenticate(context.Background(), "request"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := app.PlaceBasket(context.Background(), domain.BasketRequest{
+		IdempotencyKey: "market-basket-123", Name: "market spread", OrderType: "MARKET",
+		Legs: []domain.BasketLeg{
+			{Exchange: "NFO", TradingSymbol: "NIFTY26JUL25000CE", Product: "MIS", TransactionType: "BUY", Quantity: 50},
+			{Exchange: "NFO", TradingSymbol: "NIFTY26JUL25100CE", Product: "MIS", TransactionType: "SELL", Quantity: 50},
+		},
+	})
+	if err != nil || result.Status != "COMPLETE" || result.MaxLossKnown || result.MaxLossPaise != 0 {
+		t.Fatalf("result=%#v error=%v", result, err)
+	}
+	broker.mu.Lock()
+	defer broker.mu.Unlock()
+	if len(broker.placedRequests) != 2 {
+		t.Fatalf("placed=%#v", broker.placedRequests)
+	}
+	for _, request := range broker.placedRequests {
+		if request.OrderType != "MARKET" || request.Validity != "IOC" || request.Price != 0 {
+			t.Fatalf("market basket request=%#v", request)
+		}
 	}
 }
 
@@ -516,10 +780,23 @@ func TestInvalidModificationDoesNotConsumeIdempotencyKey(t *testing.T) {
 	if _, exists := store.idempotency[request.IdempotencyKey]; exists {
 		t.Fatal("invalid modification consumed its idempotency key")
 	}
-	broker.orders = []domain.Order{{OrderID: "order-1", Variety: "regular", Status: "OPEN", Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", Product: "MIS", OrderType: "MARKET", TransactionType: "SELL", Validity: "DAY", Quantity: 50, PendingQuantity: 50}}
+	broker.orders = []domain.Order{{OrderID: "order-1", Variety: "regular", Status: "OPEN", Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", InstrumentToken: 1, Product: "MIS", OrderType: "MARKET", TransactionType: "SELL", Validity: "DAY", Quantity: 50, PendingQuantity: 50}}
 	decision, orderID, err := app.Modify(context.Background(), "order-1", request)
 	if err != nil || !decision.Allowed || orderID != "modified-1" || broker.modifyCalls != 1 {
 		t.Fatalf("valid modification decision=%#v orderID=%q calls=%d error=%v", decision, orderID, broker.modifyCalls, err)
+	}
+}
+
+func TestModificationDoesNotInheritOmittedOrderFields(t *testing.T) {
+	app, broker, _ := newTestService(t, 0)
+	if err := app.Authenticate(context.Background(), "request"); err != nil {
+		t.Fatal(err)
+	}
+	broker.orders = []domain.Order{{OrderID: "order-1", Variety: "regular", Status: "OPEN", Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", InstrumentToken: 1, Product: "MIS", OrderType: "LIMIT", TransactionType: "SELL", Validity: "DAY", Quantity: 50, PendingQuantity: 50}}
+	request := domain.ModifyRequest{IdempotencyKey: "modify-required-123", Quantity: 50, Price: 100}
+	decision, _, err := app.Modify(context.Background(), "order-1", request)
+	if err != nil || decision.Code != domain.CodeInvalidOrder || decision.Allowed || broker.modifyCalls != 0 {
+		t.Fatalf("decision=%#v calls=%d error=%v", decision, broker.modifyCalls, err)
 	}
 }
 
@@ -590,9 +867,9 @@ func newTestService(t *testing.T, mtm float64) (*Service, *fakeBroker, *fakeStor
 		t.Fatal(err)
 	}
 	broker := &fakeBroker{mtm: mtm, instruments: []domain.Instrument{
-		{Token: 1, Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", Name: "NIFTY", InstrumentType: "FUT", Expiry: time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC), LotSize: 50},
-		{Token: 2, Exchange: "NFO", TradingSymbol: "NIFTY26JUL25000CE", Name: "NIFTY", InstrumentType: "CE", Expiry: time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC), Strike: 25_000, LotSize: 50},
-		{Token: 3, Exchange: "NFO", TradingSymbol: "NIFTY26JUL25100CE", Name: "NIFTY", InstrumentType: "CE", Expiry: time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC), Strike: 25_100, LotSize: 50},
+		{Token: 1, Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", Name: "NIFTY", InstrumentType: "FUT", Expiry: time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC), TickSize: 0.05, LotSize: 50},
+		{Token: 2, Exchange: "NFO", TradingSymbol: "NIFTY26JUL25000CE", Name: "NIFTY", InstrumentType: "CE", Expiry: time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC), Strike: 25_000, TickSize: 0.05, LotSize: 50},
+		{Token: 3, Exchange: "NFO", TradingSymbol: "NIFTY26JUL25100CE", Name: "NIFTY", InstrumentType: "CE", Expiry: time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC), Strike: 25_100, TickSize: 0.05, LotSize: 50},
 	}}
 	store := &fakeStore{record: domain.LockRecord{Status: domain.TradingActive}, idempotency: map[string]string{}}
 	app, err := New(context.Background(), broker, store, cal, log.New(io.Discard, "", 0), func() time.Time { return now })
@@ -620,6 +897,7 @@ type fakeBroker struct {
 	mtm            float64
 	positions      []domain.Position
 	orders         []domain.Order
+	trades         []domain.Trade
 	instruments    []domain.Instrument
 	placeCalls     int
 	cancelCalls    int
@@ -634,17 +912,32 @@ type fakeBroker struct {
 	placeErr       error
 	partialSell    bool
 	failShortClose bool
+	positionsErr   error
 	ordersErr      error
+	tradesErr      error
 	exitInvisible  bool
+	restoreCalls   int
 }
 
 func (f *fakeBroker) LoginURL(string) string { return "https://example.invalid/login" }
 func (f *fakeBroker) GenerateSession(context.Context, string) (domain.Session, error) {
 	return domain.Session{UserID: "test", AccessToken: "not-persisted"}, nil
 }
+func (f *fakeBroker) RestoreSession(_ context.Context, session domain.Session) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if session.AccessToken == "" {
+		return errors.New("empty session")
+	}
+	f.restoreCalls++
+	return nil
+}
 func (f *fakeBroker) Positions(context.Context) ([]domain.Position, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.positionsErr != nil {
+		return nil, f.positionsErr
+	}
 	if f.failPositions {
 		return nil, errors.New("positions unavailable")
 	}
@@ -660,6 +953,14 @@ func (f *fakeBroker) Orders(context.Context) ([]domain.Order, error) {
 		return nil, f.ordersErr
 	}
 	return append([]domain.Order(nil), f.orders...), nil
+}
+func (f *fakeBroker) Trades(context.Context) ([]domain.Trade, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.tradesErr != nil {
+		return nil, f.tradesErr
+	}
+	return append([]domain.Trade(nil), f.trades...), nil
 }
 func (f *fakeBroker) Instruments(_ context.Context, exchange string) ([]domain.Instrument, error) {
 	f.mu.Lock()
@@ -743,6 +1044,40 @@ type fakeStore struct {
 	events      []domain.AuditEvent
 	idempotency map[string]string
 	intents     map[string]domain.LiquidationIntent
+}
+
+type fakeSessionCache struct {
+	loaded      domain.Session
+	loadErr     error
+	saved       domain.Session
+	savedAt     time.Time
+	saveErr     error
+	deleteCalls int
+}
+
+func (f *fakeSessionCache) Load(context.Context) (domain.Session, error) {
+	if f.loadErr != nil {
+		return domain.Session{}, f.loadErr
+	}
+	if f.loaded.AccessToken == "" {
+		return domain.Session{}, domain.ErrNoCachedSession
+	}
+	return f.loaded, nil
+}
+
+func (f *fakeSessionCache) Save(_ context.Context, session domain.Session, issuedAt time.Time) error {
+	if f.saveErr != nil {
+		return f.saveErr
+	}
+	f.saved = session
+	f.savedAt = issuedAt
+	return nil
+}
+
+func (f *fakeSessionCache) Delete(context.Context) error {
+	f.deleteCalls++
+	f.loaded = domain.Session{}
+	return nil
 }
 
 func (f *fakeStore) CurrentLock(context.Context) (domain.LockRecord, error) { return f.record, nil }

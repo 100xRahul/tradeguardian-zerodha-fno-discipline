@@ -6,11 +6,13 @@ For a product-level explanation of the implemented behavior, workflows, safety r
 
 ## Safety behavior
 
-- Polls NFO/BFO net positions every second and sums their `m2m` values.
+- Polls NFO/BFO net positions, today's executed trades, and orders every second to reconcile the complete account state.
+- Calculates daily MTM from today's fill cash flows, the previous-close value of overnight quantity, and paid Kite WebSocket LTP ticks. The same complete live value drives the dashboard and ₹30,000 loss lock; missing or inconsistent trade/position/tick data fails closed.
 - At or below −₹30,000, persists `LOCKED`, cancels pending F&O orders, submits protected market exits, and reconciles until flat.
 - Treats all nonterminal Kite OMS states as live and tracks forced-exit parent IDs so an uncertain/autosliced exit is not duplicated.
+- Uses exact Kite instrument tokens, lot/tick metadata, and reported pending quantities. Missing or inconsistent broker safety data blocks the operation; no symbol, quantity, or tick fallback is used.
 - Rejects standalone CE/PE BUY orders. The basket builder permits validated same-underlying/same-expiry hedges, confirms protective BUY IOC fills before submitting SELL legs, and rolls incomplete baskets back.
-- Rejects an individual option SELL if it would leave uncovered short quantity after simulating the resulting position.
+- Allows standalone option SELL orders, including naked shorts. Standalone CE/PE BUY remains restricted to the validated basket workflow.
 - Fails closed when monitoring is unavailable. Cancellation and full position exits remain available.
 - Has no manual unlock. Unlock occurs at 09:15 IST on the next configured trading day.
 
@@ -23,10 +25,9 @@ Export credentials without placing them in a repository file:
 ```sh
 export KITE_API_KEY='your_key'
 export KITE_API_SECRET='your_secret'
-export KITE_MODE='production'
 ```
 
-Optional variables are shown in `.env.example`. `KITE_MODE` must be `production` or `sandbox`. Sandbox uses `https://sandbox.kite.trade/oms` for authenticated routes and `https://sandbox.kite.trade` for instrument data.
+Optional variables are shown in `.env.example`. The running application connects only to the production Kite API. Zerodha published sandbox documentation before launching user access, so no sandbox broker mode is exposed.
 
 `TRADEGUARDIAN_PUBLIC_ORIGIN` is the exact browser origin used for host/origin checks and secure cookies. It defaults to the local URL built from `TRADEGUARDIAN_PORT`.
 
@@ -46,7 +47,7 @@ Open <http://127.0.0.1:8080>, click **Connect Kite**, and complete the daily log
 
 ## VPS deployment
 
-The application remains bound to `127.0.0.1` on a VPS. Put an HTTPS reverse proxy with single-user authentication in front of it, keep the application port closed in the firewall, and set `TRADEGUARDIAN_PUBLIC_ORIGIN` to the exact external origin such as `https://trade.example.com`. Register the corresponding `https://trade.example.com/auth/callback` URL with Kite.
+The application remains bound to `127.0.0.1` on the VPS. Tailscale Serve provides private HTTPS at `https://tradeguardian.tail020b72.ts.net`; keep application port 8080 closed publicly and register `https://tradeguardian.tail020b72.ts.net/auth/callback` with Kite.
 
 Do not expose the dashboard until the reverse proxy enforces authentication: this version intentionally has no application login. Run one process against one SQLite database. The planned 4-vCPU/8-GB VPS is more than sufficient for the workload.
 
@@ -58,7 +59,11 @@ Do not expose the dashboard until the reverse proxy enforces authentication: thi
 
 The SQLite database defaults to `data/tradeguardian.db`, is created with owner-only permissions, and contains lock state, liquidation progress, durable exit intents, idempotency records, and redacted audit events. It contains no Kite credentials or access tokens.
 
+The short-lived access token is stored separately in `data/kite-session.json` (configurable with `TRADEGUARDIAN_SESSION_CACHE`) with owner-only `0600` permissions. This permits same-day service restarts without another login. On startup the token is accepted only before its recorded next-06:00-IST expiry and only after fresh Kite instruments, positions, and orders calls succeed. Expired or broker-rejected tokens are deleted. Zerodha still requires an interactive login once each trading day; TradeGuardian does not automate or bypass it.
+
 Back up the database only while the app is stopped. Restoring an older backup can restore an older lock state, so inspect `trading_state` before starting after a restore. If a lock is active, do not edit the database; let automatic unlock handle it.
+
+Do not include `kite-session.json` in backups. It is a short-lived bearer credential, not recovery data.
 
 ## Verification
 
@@ -69,19 +74,7 @@ go test -race ./...
 go vet ./...
 ```
 
-Ordinary tests use fakes and never place live orders. Any sandbox integration test must be explicitly enabled and must use sandbox credentials. There are no automatic live-account tests.
-
-To run the simulated sandbox smoke test after completing the sandbox login flow and obtaining a fresh request token:
-
-```bash
-KITE_SANDBOX_SMOKE=1 \
-KITE_API_KEY='<sandbox-key>' \
-KITE_API_SECRET='<sandbox-secret>' \
-KITE_SANDBOX_REQUEST_TOKEN='<one-time-request-token>' \
-go test -run TestKiteSandboxSmoke -count=1 ./internal/broker
-```
-
-This test reads instruments, LTP, and account state, submits one NFO futures LIMIT order approximately 1% below LTP, and cancels it if it remains pending. It runs only against the explicitly selected Kite sandbox and never runs as part of ordinary tests.
+Ordinary tests use deterministic fakes and never place live orders. There are no automatic live-account tests. Zerodha production execution must be checked only through an explicitly approved, minimal controlled test after all risk controls and static-IP configuration are verified.
 
 ## API references
 
@@ -89,5 +82,4 @@ This test reads instruments, LTP, and account state, submits one NFO futures LIM
 - [Kite orders](https://kite.trade/docs/connect/v3/orders/)
 - [Kite portfolio positions](https://kite.trade/docs/connect/v3/portfolio/)
 - [Kite rate limits](https://kite.trade/docs/connect/v3/exceptions/)
-- [Kite sandbox](https://kite.trade/docs/connect/v3/sandbox/)
 - [Official Go client](https://pkg.go.dev/github.com/zerodha/gokiteconnect/v4)

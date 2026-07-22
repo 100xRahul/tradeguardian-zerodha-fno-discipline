@@ -19,6 +19,13 @@ func ValidateBasket(request domain.BasketRequest, instruments map[string]domain.
 	if len(request.Legs) < 2 || len(request.Legs) > 4 {
 		return ValidatedBasket{}, fmt.Errorf("a basket must contain 2 to 4 option legs")
 	}
+	request.OrderType = strings.ToUpper(strings.TrimSpace(request.OrderType))
+	if request.OrderType == "" {
+		request.OrderType = "LIMIT"
+	}
+	if request.OrderType != "LIMIT" && request.OrderType != "MARKET" {
+		return ValidatedBasket{}, fmt.Errorf("basket order type must be LIMIT or MARKET")
+	}
 	validated := ValidatedBasket{Request: request, Instruments: make(map[string]domain.Instrument)}
 	var base domain.Instrument
 	var product string
@@ -39,8 +46,8 @@ func ValidateBasket(request domain.BasketRequest, instruments map[string]domain.
 		if !ok || !domain.IsOptionType(instrument.InstrumentType) {
 			return ValidatedBasket{}, fmt.Errorf("leg %d is not a recognised option contract", index+1)
 		}
-		if strings.TrimSpace(instrument.Name) == "" || instrument.Expiry.IsZero() || instrument.Strike <= 0 || math.IsNaN(instrument.Strike) || math.IsInf(instrument.Strike, 0) || math.IsNaN(instrument.TickSize) || math.IsInf(instrument.TickSize, 0) {
-			return ValidatedBasket{}, fmt.Errorf("leg %d has incomplete underlying, expiry, or strike metadata", index+1)
+		if instrument.Token == 0 || strings.TrimSpace(instrument.Name) == "" || instrument.Expiry.IsZero() || instrument.Strike <= 0 || math.IsNaN(instrument.Strike) || math.IsInf(instrument.Strike, 0) || instrument.TickSize <= 0 || math.IsNaN(instrument.TickSize) || math.IsInf(instrument.TickSize, 0) {
+			return ValidatedBasket{}, fmt.Errorf("leg %d has incomplete instrument token, underlying, expiry, strike, or tick metadata", index+1)
 		}
 		if leg.Product != "MIS" && leg.Product != "NRML" {
 			return ValidatedBasket{}, fmt.Errorf("leg %d product must be MIS or NRML", index+1)
@@ -51,11 +58,15 @@ func ValidateBasket(request domain.BasketRequest, instruments map[string]domain.
 		if leg.Quantity <= 0 || instrument.LotSize <= 0 || leg.Quantity%instrument.LotSize != 0 {
 			return ValidatedBasket{}, fmt.Errorf("leg %d quantity must be a positive multiple of lot size %d", index+1, instrument.LotSize)
 		}
-		if leg.LimitPrice <= 0 || math.IsNaN(leg.LimitPrice) || math.IsInf(leg.LimitPrice, 0) {
-			return ValidatedBasket{}, fmt.Errorf("leg %d requires a positive IOC limit price", index+1)
-		}
-		if instrument.TickSize > 0 && !tickAligned(leg.LimitPrice, instrument.TickSize) {
-			return ValidatedBasket{}, fmt.Errorf("leg %d limit price must use tick size %.4g", index+1, instrument.TickSize)
+		if validated.Request.OrderType == "LIMIT" {
+			if leg.LimitPrice <= 0 || math.IsNaN(leg.LimitPrice) || math.IsInf(leg.LimitPrice, 0) {
+				return ValidatedBasket{}, fmt.Errorf("leg %d requires a positive IOC limit price", index+1)
+			}
+			if !tickAligned(leg.LimitPrice, instrument.TickSize) {
+				return ValidatedBasket{}, fmt.Errorf("leg %d limit price must use tick size %.4g", index+1, instrument.TickSize)
+			}
+		} else if leg.LimitPrice != 0 {
+			return ValidatedBasket{}, fmt.Errorf("leg %d MARKET order must not include a limit price", index+1)
 		}
 		if index == 0 {
 			base, product = instrument, leg.Product
@@ -83,6 +94,9 @@ func ValidateBasket(request domain.BasketRequest, instruments map[string]domain.
 		if shortQty > longQty {
 			return ValidatedBasket{}, fmt.Errorf("%s short quantity exceeds its protective long quantity", optionType)
 		}
+	}
+	if validated.Request.OrderType == "MARKET" {
+		return validated, nil
 	}
 	levels := make([]float64, 0, len(strikes))
 	for strike := range strikes {

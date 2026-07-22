@@ -48,6 +48,7 @@ const (
 )
 
 var ErrNotAuthenticated = errors.New("kite session is not authenticated")
+var ErrNoCachedSession = errors.New("no cached Kite session")
 
 type OrderRequest struct {
 	IdempotencyKey  string  `json:"idempotency_key"`
@@ -86,6 +87,7 @@ type BasketLeg struct {
 type BasketRequest struct {
 	IdempotencyKey string      `json:"idempotency_key"`
 	Name           string      `json:"name"`
+	OrderType      string      `json:"order_type"`
 	Legs           []BasketLeg `json:"legs"`
 }
 
@@ -94,6 +96,7 @@ type BasketResult struct {
 	Status         string   `json:"status"`
 	Message        string   `json:"message"`
 	MaxLossPaise   int64    `json:"max_loss_paise"`
+	MaxLossKnown   bool     `json:"max_loss_known"`
 	OrderIDs       []string `json:"order_ids"`
 	RollbackOrders []string `json:"rollback_order_ids,omitempty"`
 }
@@ -113,8 +116,25 @@ type Position struct {
 	InstrumentToken uint32  `json:"instrument_token"`
 	Product         string  `json:"product"`
 	Quantity        int     `json:"quantity"`
+	OvernightQty    int     `json:"overnight_quantity"`
+	Multiplier      float64 `json:"multiplier"`
+	ClosePrice      float64 `json:"close_price"`
+	BuyM2M          float64 `json:"buy_m2m"`
+	SellM2M         float64 `json:"sell_m2m"`
 	M2M             float64 `json:"m2m"`
 	LastPrice       float64 `json:"last_price"`
+}
+
+type Trade struct {
+	TradeID         string  `json:"trade_id"`
+	OrderID         string  `json:"order_id"`
+	Exchange        string  `json:"exchange"`
+	TradingSymbol   string  `json:"tradingsymbol"`
+	InstrumentToken uint32  `json:"instrument_token"`
+	Product         string  `json:"product"`
+	TransactionType string  `json:"transaction_type"`
+	Quantity        int     `json:"quantity"`
+	AveragePrice    float64 `json:"average_price"`
 }
 
 type Order struct {
@@ -150,23 +170,6 @@ func (o Order) Cancellable() bool {
 	}
 }
 
-// RemainingQuantity prefers Kite's explicit pending quantity. Interim OMS
-// states can briefly report zero pending quantity before registration, so a
-// nonterminal order falls back to its unfilled, uncancelled quantity.
-func (o Order) RemainingQuantity() int {
-	if !o.Cancellable() {
-		return 0
-	}
-	if o.PendingQuantity > 0 {
-		return o.PendingQuantity
-	}
-	remaining := o.Quantity - o.FilledQuantity - o.CancelledQty
-	if remaining > 0 {
-		return remaining
-	}
-	return 0
-}
-
 type Instrument struct {
 	Token          uint32    `json:"instrument_token"`
 	Exchange       string    `json:"exchange"`
@@ -184,11 +187,50 @@ type Session struct {
 	AccessToken string
 }
 
+// SessionRestorer installs a previously generated, same-day access token into
+// a broker adapter. The service validates it immediately through fresh broker
+// reads before allowing any trading action.
+type SessionRestorer interface {
+	RestoreSession(ctx context.Context, session Session) error
+}
+
+// SessionCache persists the short-lived Kite access token outside the trading
+// database. Implementations must keep it owner-only and enforce token expiry.
+type SessionCache interface {
+	Load(ctx context.Context) (Session, error)
+	Save(ctx context.Context, session Session, issuedAt time.Time) error
+	Delete(ctx context.Context) error
+}
+
+type MarketTick struct {
+	InstrumentToken uint32
+	LastPrice       float64
+	ReceivedAt      time.Time
+}
+
+type MarketStreamCallbacks struct {
+	OnTick        func(MarketTick)
+	OnOrderUpdate func()
+	OnStatus      func(connected bool)
+	OnError       func(message string)
+}
+
+// MarketStreamer is an optional broker capability. When present, the service
+// requires a connected stream and complete LTP coverage before it permits new
+// exposure. The service combines those LTPs with same-day trade fills and the
+// overnight opening mark for the daily loss decision. Order updates prompt
+// immediate REST reconciliation.
+type MarketStreamer interface {
+	StartMarketStream(ctx context.Context, tokens []uint32, callbacks MarketStreamCallbacks) error
+	SetMarketSubscriptions(tokens []uint32) error
+}
+
 type Broker interface {
 	LoginURL(state string) string
 	GenerateSession(ctx context.Context, requestToken string) (Session, error)
 	Positions(ctx context.Context) ([]Position, error)
 	Orders(ctx context.Context) ([]Order, error)
+	Trades(ctx context.Context) ([]Trade, error)
 	Instruments(ctx context.Context, exchange string) ([]Instrument, error)
 	Place(ctx context.Context, request OrderRequest) (string, error)
 	Modify(ctx context.Context, orderID string, request ModifyRequest) (string, error)
@@ -251,6 +293,18 @@ type Snapshot struct {
 	NextUnlock      *time.Time    `json:"next_unlock,omitempty"`
 	OpenPositionQty int           `json:"open_position_quantity"`
 	PendingOrders   int           `json:"pending_orders"`
+	LiveMTMPaise    *int64        `json:"live_mtm_paise,omitempty"`
+	MarketData      string        `json:"market_data_status"`
+	MarketDataAt    *time.Time    `json:"market_data_at,omitempty"`
+}
+
+// DashboardState is one coherent, in-memory view of the broker state observed
+// by the risk monitor. It is safe to stream to the browser without making the
+// browser poll Kite or assemble independently timed API responses.
+type DashboardState struct {
+	Status    Snapshot   `json:"status"`
+	Positions []Position `json:"positions"`
+	Orders    []Order    `json:"orders"`
 }
 
 func IsFNOExchange(exchange string) bool { return exchange == "NFO" || exchange == "BFO" }
