@@ -20,6 +20,8 @@ import (
 
 const (
 	forcedExitTag         = domain.ForcedExitTag
+	legacyForcedExitTag   = "tradeguardian"
+	pendingExitPrefix     = "pending-exit:"
 	pendingOrderPrefix    = "pending-order:"
 	pendingModifyPrefix   = "pending-modify:"
 	marketDataUnavailable = "live market data unavailable; loss monitoring cannot calculate current P&L"
@@ -459,6 +461,13 @@ func (s *Service) PollOnce(ctx context.Context) error {
 	}
 	s.orders = filterOrders(orders)
 	s.decorateOrdersLocked()
+	if err := s.reconcileForcedExitIntentsLocked(ctx, s.orders); err != nil {
+		s.runtime = domain.RuntimeDegraded
+		s.lockRecord.LastError = "forced exit reconciliation failed"
+		s.gate.Unlock()
+		s.signal()
+		return err
+	}
 	if s.trading == domain.TradingLocked && !portfolioFlat(s.positions, s.orders) && s.lockRecord.LiquidationState == "COMPLETED" {
 		s.lockRecord.LiquidationState = "IN_PROGRESS"
 		s.lockRecord.LastError = "new F&O exposure detected while locked"
@@ -1091,7 +1100,10 @@ func phaseIDs(phase []phaseOrder) []string {
 	return ids
 }
 
-func (s *Service) ExitPosition(ctx context.Context, token uint32, product string) (string, error) {
+// ExitPosition submits a risk-reducing exit for the given token/product. A
+// quantity <= 0 exits the full open quantity; otherwise it must be a positive
+// multiple of the instrument's lot size not exceeding the open quantity.
+func (s *Service) ExitPosition(ctx context.Context, token uint32, product string, quantity int) (string, error) {
 	s.gate.Lock()
 	defer s.gate.Unlock()
 	if !s.authed {
@@ -1101,6 +1113,9 @@ func (s *Service) ExitPosition(ctx context.Context, token uint32, product string
 	if product != "MIS" && product != "NRML" {
 		return "", fmt.Errorf("position product must be MIS or NRML")
 	}
+	if quantity < 0 {
+		return "", fmt.Errorf("exit quantity must not be negative")
+	}
 	positions, err := s.broker.Positions(ctx)
 	if err != nil {
 		if errors.Is(err, domain.ErrNotAuthenticated) {
@@ -1108,31 +1123,61 @@ func (s *Service) ExitPosition(ctx context.Context, token uint32, product string
 		}
 		return "", err
 	}
+	orders, orderErr := s.broker.Orders(ctx)
+	if orderErr != nil {
+		if errors.Is(orderErr, domain.ErrNotAuthenticated) {
+			s.setAuthRequiredLocked("Kite session expired while reading orders")
+		}
+		return "", orderErr
+	}
+	if err := s.reconcileForcedExitIntentsLocked(ctx, filterOrders(orders)); err != nil {
+		return "", err
+	}
+	s.orders = filterOrders(orders)
 	for _, position := range positions {
 		if position.InstrumentToken == token && position.Product == product && domain.IsFNOExchange(position.Exchange) && position.Quantity != 0 {
+			openQuantity := position.Quantity
+			if openQuantity < 0 {
+				openQuantity = -openQuantity
+			}
+			exitQuantity := quantity
+			if exitQuantity == 0 {
+				exitQuantity = openQuantity
+			}
+			if exitQuantity > openQuantity {
+				return "", fmt.Errorf("exit quantity %d exceeds open position quantity %d", exitQuantity, openQuantity)
+			}
 			key := positionKeyFor(position.Exchange, position.TradingSymbol, position.Product)
 			if existingID, submitted := s.forcedExits[key]; submitted {
 				found, active := intentOrderState(s.orders, existingID)
 				if !found || active {
 					return existingID, fmt.Errorf("a previous exit submission is still awaiting broker reconciliation")
 				}
-				delete(s.forcedExits, key)
-				delete(s.forcedExitAt, key)
+				if err := s.clearForcedExitIntentLocked(ctx, key); err != nil {
+					return existingID, err
+				}
 			}
 			instrument, ok := s.instrumentByTokenLocked(token)
 			if !ok || instrument.Exchange != position.Exchange || instrument.TradingSymbol != position.TradingSymbol {
 				return "", fmt.Errorf("position instrument token was not found in the current catalogue; risk-reducing exit cannot be verified")
 			}
+			if instrument.LotSize > 0 && exitQuantity%instrument.LotSize != 0 {
+				return "", fmt.Errorf("exit quantity must be a multiple of lot size %d", instrument.LotSize)
+			}
 			if err := s.reserveForcedExitIntentLocked(ctx, key); err != nil {
 				return "", err
 			}
-			orderID, err := s.broker.ExitPosition(ctx, position)
+			orderID, err := s.broker.ExitPosition(ctx, position, exitQuantity)
 			if orderID != "" {
 				s.forcedExits[key] = orderID
 				if persistErr := s.persistForcedExitIntentLocked(ctx, key, orderID); persistErr != nil {
 					err = errors.Join(err, persistErr)
 				}
-				s.auditBestEffort(ctx, domain.AuditEvent{Type: "POSITION_EXIT", Code: domain.CodeApproved, Message: "Risk-reducing position exit submitted.", OrderID: orderID, Metadata: map[string]any{"instrument_token": token, "exchange": position.Exchange, "tradingsymbol": position.TradingSymbol, "product": position.Product}})
+				message := "Risk-reducing position exit submitted."
+				if exitQuantity < openQuantity {
+					message = "Risk-reducing partial position exit submitted."
+				}
+				s.auditBestEffort(ctx, domain.AuditEvent{Type: "POSITION_EXIT", Code: domain.CodeApproved, Message: message, OrderID: orderID, Metadata: map[string]any{"instrument_token": token, "exchange": position.Exchange, "tradingsymbol": position.TradingSymbol, "product": position.Product, "quantity": exitQuantity}})
 				if s.trading == domain.TradingActive {
 					s.runtime = domain.RuntimeDegraded
 					s.lockRecord.LastError = "position exit is awaiting a fresh broker reconciliation"
@@ -1293,7 +1338,11 @@ func (s *Service) liquidationPass(ctx context.Context) (bool, error) {
 			continue
 		}
 		intents[key] = s.forcedExitIntent(key)
-		orderID, err := s.broker.ExitPosition(ctx, position)
+		liquidationQuantity := position.Quantity
+		if liquidationQuantity < 0 {
+			liquidationQuantity = -liquidationQuantity
+		}
+		orderID, err := s.broker.ExitPosition(ctx, position, liquidationQuantity)
 		if orderID != "" {
 			s.gate.Lock()
 			s.forcedExits[key] = orderID
@@ -1952,13 +2001,8 @@ func portfolioFlat(positions []domain.Position, orders []domain.Order) bool {
 }
 
 func isForcedExitOrder(order domain.Order, intents map[string]string) bool {
-	if order.Tag == forcedExitTag {
+	if isForcedExitTaggedOrder(order) {
 		return true
-	}
-	for _, tag := range order.Tags {
-		if tag == forcedExitTag {
-			return true
-		}
 	}
 	for _, parentID := range intents {
 		if orderMatchesIntent(order, parentID) {
@@ -1966,6 +2010,116 @@ func isForcedExitOrder(order domain.Order, intents map[string]string) bool {
 		}
 	}
 	return false
+}
+
+func isForcedExitTaggedOrder(order domain.Order) bool {
+	if order.Tag == forcedExitTag || order.Tag == legacyForcedExitTag {
+		return true
+	}
+	for _, tag := range order.Tags {
+		if tag == forcedExitTag || tag == legacyForcedExitTag {
+			return true
+		}
+	}
+	return false
+}
+
+func forcedExitOrdersForPosition(orders []domain.Order, positionKey string) []domain.Order {
+	result := make([]domain.Order, 0)
+	for _, order := range orders {
+		if positionKeyFor(order.Exchange, order.TradingSymbol, order.Product) != positionKey {
+			continue
+		}
+		if isForcedExitTaggedOrder(order) {
+			result = append(result, order)
+		}
+	}
+	return result
+}
+
+func canonicalForcedExitIntentID(orders []domain.Order) string {
+	for _, order := range orders {
+		if order.Cancellable() && order.ParentOrderID == "" {
+			return order.OrderID
+		}
+	}
+	for _, order := range orders {
+		if order.Cancellable() && order.ParentOrderID != "" {
+			return order.ParentOrderID
+		}
+	}
+	for _, order := range orders {
+		if order.ParentOrderID == "" {
+			return order.OrderID
+		}
+	}
+	if len(orders) > 0 {
+		if orders[0].ParentOrderID != "" {
+			return orders[0].ParentOrderID
+		}
+		return orders[0].OrderID
+	}
+	return ""
+}
+
+func (s *Service) clearForcedExitIntentLocked(ctx context.Context, key string) error {
+	if err := s.store.DeleteLiquidationIntent(ctx, key); err != nil {
+		return err
+	}
+	delete(s.forcedExits, key)
+	delete(s.forcedExitAt, key)
+	return nil
+}
+
+func (s *Service) reconcileForcedExitIntentsLocked(ctx context.Context, orders []domain.Order) error {
+	var persistErr error
+	keys := make([]string, 0, len(s.forcedExits))
+	for key := range s.forcedExits {
+		keys = append(keys, key)
+	}
+	for _, key := range keys {
+		intentID := s.forcedExits[key]
+		found, active := intentOrderState(orders, intentID)
+		if found && active {
+			continue
+		}
+		if found && !active {
+			if err := s.clearForcedExitIntentLocked(ctx, key); err != nil {
+				persistErr = errors.Join(persistErr, err)
+			}
+			continue
+		}
+		tagged := forcedExitOrdersForPosition(orders, key)
+		if len(tagged) == 0 {
+			if strings.HasPrefix(intentID, pendingExitPrefix) {
+				if err := s.clearForcedExitIntentLocked(ctx, key); err != nil {
+					persistErr = errors.Join(persistErr, err)
+				}
+			}
+			continue
+		}
+		parentID := canonicalForcedExitIntentID(tagged)
+		hasLive := false
+		for _, order := range tagged {
+			if order.Cancellable() {
+				hasLive = true
+				break
+			}
+		}
+		if hasLive {
+			if parentID != "" && parentID != intentID {
+				s.forcedExits[key] = parentID
+				if err := s.persistForcedExitIntentLocked(ctx, key, parentID); err != nil {
+					persistErr = errors.Join(persistErr, err)
+				}
+			}
+			continue
+		}
+		if err := s.clearForcedExitIntentLocked(ctx, key); err != nil {
+			persistErr = errors.Join(persistErr, err)
+		}
+	}
+	return persistErr
 }
 
 func orderHasTagPrefix(order domain.Order, prefix string) bool {

@@ -235,7 +235,7 @@ type Broker interface {
 	Place(ctx context.Context, request OrderRequest) (string, error)
 	Modify(ctx context.Context, orderID string, request ModifyRequest) (string, error)
 	Cancel(ctx context.Context, variety, orderID string) error
-	ExitPosition(ctx context.Context, position Position) (string, error)
+	ExitPosition(ctx context.Context, position Position, quantity int) (string, error)
 }
 
 type LockRecord struct {

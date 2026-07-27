@@ -10,7 +10,10 @@
 <body>
   <header>
     <div><span class="eyebrow">ZERODHA F&amp;O CONTROL</span><h1>TradeGuardian</h1></div>
-    <a class="button secondary" id="kite-connect" href="/auth/login" data-login-href="/auth/login">Connect Kite</a>
+    <div class="header-actions">
+      <button type="button" class="button secondary" id="theme-toggle" aria-label="Toggle light or dark theme">Light theme</button>
+      <a class="button secondary kite-status" id="kite-connect" href="/auth/login" role="status" aria-live="polite">Checking Kite session…</a>
+    </div>
   </header>
   <main>
     <section id="alert" class="alert neutral">Loading risk state…</section>
@@ -21,12 +24,25 @@
       <article><span>Portfolio reconciled at</span><strong id="refresh">—</strong></article>
     </section>
 
+    <section class="panel wide" id="watchlist-panel">
+      <div class="panel-title">
+        <div><span class="eyebrow">QUICK ACCESS</span><h2>Watchlist</h2></div>
+        <span class="pill" id="watchlist-count">0 contracts</span>
+      </div>
+      <div class="watchlist-toolbar fields two">
+        <label>Exchange<select id="watchlist-exchange"><option>NFO</option><option>BFO</option></select></label>
+        <label>Contract search<span class="instrument-picker" id="watchlist-picker"><input type="search" autocomplete="off" role="combobox" aria-expanded="false" aria-controls="watchlist-results" placeholder="Search NIFTY, BANKNIFTY, SENSEX…"><span class="instrument-results" id="watchlist-results" role="listbox"></span></span></label>
+      </div>
+      <p class="notice watchlist-help">Same instant instrument search as the order ticket. Pick a result to add it here and load the order form.</p>
+      <div id="watchlist-items" class="watchlist-items" aria-live="polite"><p class="empty watchlist-empty">Search above to add contracts. Click a saved contract to load it in the order ticket.</p></div>
+    </section>
+
     <div class="grid">
       <section class="panel">
         <div class="panel-title"><div><span class="eyebrow">GUARDED ENTRY</span><h2>Order ticket</h2></div><span class="pill">NFO / BFO</span></div>
         <form id="order-form">
           <div class="fields two"><label>Exchange<select name="exchange" id="order-exchange"><option>NFO</option><option>BFO</option></select></label><label>Contract search<span class="instrument-picker" id="order-instrument"><input type="search" autocomplete="off" role="combobox" aria-expanded="false" aria-controls="order-instrument-results" placeholder="Search NIFTY, BANKNIFTY, SENSEX…"><span class="instrument-results" id="order-instrument-results" role="listbox"></span><span class="selected-instrument"></span></span></label></div>
-          <div class="fields three"><label>Side<select name="transaction_type"><option>SELL</option><option>BUY</option></select></label><label>Product<select name="product"><option>MIS</option><option>NRML</option></select></label><label>Lots<input name="lots" type="number" min="1" step="1" value="1" required><span class="field-help" id="order-quantity">Select a contract to calculate quantity</span></label></div>
+          <div class="fields three"><label>Side<select name="transaction_type"><option>SELL</option><option>BUY</option></select></label><label>Product<select name="product"><option selected>NRML</option><option>MIS</option></select></label><label>Lots<input name="lots" type="number" min="1" step="1" value="1" required><span class="field-help" id="order-quantity">Select a contract to calculate quantity</span></label></div>
           <div class="fields three"><label>Type<select name="order_type" id="order-type"><option>MARKET</option><option>LIMIT</option><option>SL</option><option>SL-M</option></select></label><label>Price<input name="price" id="order-price" type="number" value="0"></label><label>Trigger<input name="trigger_price" id="order-trigger" type="number" value="0"></label></div>
           <input type="hidden" name="variety" value="regular"><input type="hidden" name="validity" value="DAY">
           <button id="submit-order" type="submit">Run rule check &amp; place</button>
@@ -42,10 +58,10 @@
       </section>
     </div>
 
-    <section class="panel wide">
+    <section class="panel wide panel-hedge">
       <div class="panel-title"><div><span class="eyebrow">VALIDATED HEDGE</span><h2>Option basket</h2></div><span class="pill">IOC · 2–4 selected legs</span></div>
       <form id="basket-form">
-        <div class="fields three"><label>Basket name<input name="name" required placeholder="Bull call spread"></label><label>Exchange<select name="basket_exchange" id="basket-exchange"><option>NFO</option><option>BFO</option></select></label><label>Product<select name="basket_product"><option>MIS</option><option>NRML</option></select></label><label>Execution<select name="basket_order_type" id="basket-order-type"><option value="MARKET">Market</option><option value="LIMIT">Limit</option></select></label></div>
+        <div class="fields three"><label for="basket-name">Basket name<input id="basket-name" name="basket_name" autocomplete="off" required placeholder="Bull call spread"></label><label>Exchange<select name="basket_exchange" id="basket-exchange"><option>NFO</option><option>BFO</option></select></label><label>Product<select name="basket_product"><option selected>NRML</option><option>MIS</option></select></label><label>Execution<select name="basket_order_type" id="basket-order-type"><option value="MARKET">Market</option><option value="LIMIT">Limit</option></select></label></div>
         <div id="basket-legs"></div>
         <div class="basket-actions"><button type="button" class="secondary small" id="add-leg">Add leg</button><button id="submit-basket" type="submit">Validate &amp; deploy basket</button></div>
         <p class="notice">Only selected rows are submitted. All legs must share an underlying and expiry. Protective BUY IOC fills are confirmed before SELL legs are sent; MARKET uses Kite automatic market protection.</p>
@@ -53,10 +69,18 @@
       </form>
     </section>
 
-    <section class="panel wide"><div class="panel-title"><div><span class="eyebrow">LIVE · AUTO-UPDATING</span><h2>Positions</h2></div><span class="pill" id="live-connection">Connecting…</span></div><div class="table-wrap"><table><thead><tr><th>Contract</th><th>Product</th><th>Qty</th><th>LTP</th><th>MTM</th><th></th></tr></thead><tbody id="positions"></tbody></table></div></section>
-    <section class="panel wide"><div class="panel-title"><div><span class="eyebrow">TODAY</span><h2>Orders</h2></div></div><div class="table-wrap"><table><thead><tr><th>ID</th><th>Contract</th><th>Side</th><th>Type</th><th>Qty / Kite pending</th><th>Status</th><th></th></tr></thead><tbody id="orders"></tbody></table></div></section>
-    <section class="panel wide"><div class="panel-title"><div><span class="eyebrow">IMMUTABLE LOG</span><h2>Audit events</h2></div></div><div class="table-wrap"><table><thead><tr><th>Time</th><th>Event</th><th>Code</th><th>Message</th></tr></thead><tbody id="audit"></tbody></table></div></section>
+    <section class="panel wide"><div class="panel-title"><div><span class="eyebrow">LIVE · AUTO-UPDATING</span><h2>Positions</h2></div><div class="panel-title-actions"><button type="button" class="danger-button small" id="exit-selected" hidden>Exit selected</button><span class="pill" id="live-connection">Connecting…</span></div></div><div class="table-wrap"><table><thead><tr><th class="select-col"><input type="checkbox" id="select-all-positions" aria-label="Select all positions"></th><th>Contract</th><th>Product</th><th>Qty</th><th>LTP</th><th>MTM</th><th></th></tr></thead><tbody id="positions"></tbody></table></div></section>
+    <section class="panel wide" id="orders-panel"><div class="panel-title"><div><span class="eyebrow">TODAY</span><h2>Orders</h2></div><div class="panel-title-actions"><button type="button" class="secondary small" data-collapsible-toggle aria-expanded="false" aria-controls="orders-table-wrap">Expand</button></div></div><div class="table-wrap" id="orders-table-wrap"><table><thead><tr><th>ID</th><th>Contract</th><th>Side</th><th>Type</th><th>Qty / Kite pending</th><th>Status</th><th></th></tr></thead><tbody id="orders"></tbody></table></div></section>
+    <section class="panel wide" id="audit-panel"><div class="panel-title"><div><span class="eyebrow">IMMUTABLE LOG</span><h2>Audit events</h2></div><div class="panel-title-actions"><button type="button" class="secondary small" data-collapsible-toggle aria-expanded="false" aria-controls="audit-table-wrap">Expand</button></div></div><div class="table-wrap" id="audit-table-wrap"><table><thead><tr><th>Time</th><th>Event</th><th>Code</th><th>Message</th></tr></thead><tbody id="audit"></tbody></table></div></section>
   </main>
+  <div id="modal-root" class="modal-root hidden" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal-backdrop" data-modal-dismiss></div>
+    <article class="modal-card">
+      <h3 id="modal-title"></h3>
+      <p id="modal-body"></p>
+      <div class="modal-actions" id="modal-actions"></div>
+    </article>
+  </div>
   <script src="/app.js" defer></script>
 </body>
 </html>

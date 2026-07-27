@@ -266,7 +266,8 @@ func (s *Server) cancel(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) exitPosition(w http.ResponseWriter, r *http.Request) {
 	var request struct {
-		Product string `json:"product"`
+		Product  string `json:"product"`
+		Quantity int    `json:"quantity"`
 	}
 	if err := decodeJSON(w, r, &request); err != nil {
 		writeError(w, http.StatusBadRequest, "INVALID_JSON", err.Error())
@@ -279,11 +280,15 @@ func (s *Server) exitPosition(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	orderID, err := s.service.ExitPosition(ctx, uint32(token64), request.Product)
+	orderID, err := s.service.ExitPosition(ctx, uint32(token64), request.Product, request.Quantity)
 	if err != nil {
+		message := err.Error()
+		if message == "" {
+			message = "Position exit could not be fully confirmed. Reconcile the broker order book."
+		}
 		writeJSON(w, http.StatusBadGateway, map[string]any{
 			"order_id": orderID,
-			"error":    map[string]string{"code": "EXIT_FAILED", "message": "Position exit could not be fully confirmed. Reconcile the broker order book."},
+			"error":    map[string]string{"code": "EXIT_FAILED", "message": message},
 		})
 		return
 	}

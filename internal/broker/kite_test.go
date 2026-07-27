@@ -77,6 +77,15 @@ func TestOrderParamsApplyProtectionOnlyToMarketTypes(t *testing.T) {
 	}
 }
 
+func TestExitNeedsAutosliceDetectsFreezeLimitErrors(t *testing.T) {
+	if exitNeedsAutoslice(errors.New("quantity should be greater than or equal to 1755 for order slicing")) {
+		t.Fatal("autoslice minimum error must not trigger autoslice retry")
+	}
+	if !exitNeedsAutoslice(errors.New("order exceeds freeze quantity")) {
+		t.Fatal("expected freeze-limit error to request autoslice retry")
+	}
+}
+
 func TestAutoslicePartialFailureIsReturned(t *testing.T) {
 	response := kiteconnect.OrderResponse{OrderID: "parent", Children: []kiteconnect.OrderChild{
 		{OrderID: "child-1"},

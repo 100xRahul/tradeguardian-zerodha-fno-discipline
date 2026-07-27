@@ -410,12 +410,13 @@ func (k *Kite) Cancel(ctx context.Context, variety, orderID string) error {
 	return ctx.Err()
 }
 
-func (k *Kite) ExitPosition(ctx context.Context, position domain.Position) (string, error) {
+// ExitPosition places a market order for the given quantity against position's
+// direction. quantity must already be validated by the caller as positive and
+// not exceeding the position's open quantity; a full exit passes abs(position.Quantity).
+func (k *Kite) ExitPosition(ctx context.Context, position domain.Position, quantity int) (string, error) {
 	transaction := "SELL"
-	quantity := position.Quantity
-	if quantity < 0 {
+	if position.Quantity < 0 {
 		transaction = "BUY"
-		quantity = -quantity
 	}
 	request := domain.OrderRequest{
 		Variety: "regular", Exchange: position.Exchange, TradingSymbol: position.TradingSymbol,
@@ -435,10 +436,9 @@ func (k *Kite) ExitPosition(ctx context.Context, position domain.Position) (stri
 	}
 	params := toOrderParams(request)
 	params.MarketProtection = -1
-	params.Autoslice = true
-	response, err := k.trade.PlaceOrder("regular", params)
+	response, err := k.placeExitOrder(params)
 	if err != nil {
-		return "", kiteError("exit Kite position", err)
+		return "", err
 	}
 	if response.OrderID == "" {
 		return "", fmt.Errorf("Kite accepted exit without an order id")
@@ -447,6 +447,39 @@ func (k *Kite) ExitPosition(ctx context.Context, position domain.Position) (stri
 		return response.OrderID, err
 	}
 	return response.OrderID, ctx.Err()
+}
+
+// placeExitOrder places a forced exit without autoslice by default. Per Kite
+// Connect docs, autoslice is only for quantities above exchange freeze limits;
+// enabling it on smaller exits is rejected (e.g. Nifty freeze qty 1755).
+func (k *Kite) placeExitOrder(params kiteconnect.OrderParams) (kiteconnect.OrderResponse, error) {
+	params.Autoslice = false
+	response, err := k.trade.PlaceOrder("regular", params)
+	if err == nil {
+		return response, nil
+	}
+	if !exitNeedsAutoslice(err) {
+		return response, kiteError("exit Kite position", err)
+	}
+	params.Autoslice = true
+	response, err = k.trade.PlaceOrder("regular", params)
+	if err != nil {
+		return response, kiteError("exit Kite position", err)
+	}
+	return response, nil
+}
+
+func exitNeedsAutoslice(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "for order slicing") {
+		return false
+	}
+	return strings.Contains(message, "freeze") ||
+		strings.Contains(message, "maximum") ||
+		strings.Contains(message, "max quantity")
 }
 
 func (k *Kite) StartMarketStream(ctx context.Context, tokens []uint32, callbacks domain.MarketStreamCallbacks) error {

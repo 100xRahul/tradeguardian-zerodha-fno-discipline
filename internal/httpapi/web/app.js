@@ -5,6 +5,136 @@ const rupees = value => new Intl.NumberFormat('en-IN', {style: 'currency', curre
 const escapeHTML = value => String(value ?? '').replace(/[&<>'"]/g, character => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'}[character]));
 const randomID = () => crypto.randomUUID().replaceAll('-', '');
 const validPositiveNumber = value => Number.isFinite(Number(value)) && Number(value) > 0;
+const LOSS_WARNING_PAISE = 2_000_000;
+const LOCK_THRESHOLD_PAISE = 3_000_000;
+const THEME_KEY = 'tg-theme';
+const BASKET_NAME_KEY = 'tg-basket-name';
+const WATCHLIST_KEY = 'tg-watchlist';
+const KITE_LOGIN_PATH = '/auth/login';
+const LOSS_WARNING_KEY = 'tg-loss-warning-shown';
+const selectedPositions = new Set();
+const orderSnapshots = new Map();
+let modalResolver = null;
+let latestPositions = [];
+let kiteStatusKnown = false;
+let activeWatchlistKey = '';
+
+function positionKey(token, product) {
+  return `${token}:${product}`;
+}
+
+function applyTheme(theme) {
+  const next = theme === 'light' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = next;
+  localStorage.setItem(THEME_KEY, next);
+  byId('theme-toggle').textContent = next === 'light' ? 'Dark theme' : 'Light theme';
+}
+
+function initTheme() {
+  const stored = localStorage.getItem(THEME_KEY);
+  applyTheme(stored === 'light' ? 'light' : 'dark');
+}
+
+function initCollapsiblePanels() {
+  document.querySelectorAll('[data-collapsible-toggle]').forEach(toggle => {
+    const contentID = toggle.getAttribute('aria-controls');
+    const content = contentID ? byId(contentID) : null;
+    if (!content) return;
+    const setExpanded = expanded => {
+      toggle.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+      toggle.textContent = expanded ? 'Minimize' : 'Expand';
+      content.hidden = !expanded;
+    };
+    setExpanded(false);
+    toggle.addEventListener('click', () => {
+      const expanded = toggle.getAttribute('aria-expanded') === 'true';
+      setExpanded(!expanded);
+    });
+  });
+}
+
+function closeModal(result = false) {
+  const root = byId('modal-root');
+  root.classList.add('hidden');
+  byId('modal-title').textContent = '';
+  byId('modal-body').textContent = '';
+  byId('modal-actions').innerHTML = '';
+  byId('modal-root').querySelector('.modal-card').className = 'modal-card';
+  const resolve = modalResolver;
+  modalResolver = null;
+  if (resolve) resolve(result);
+}
+
+function showModal({title, body, tone = '', actions = [{label: 'OK', primary: true}]}) {
+  return new Promise(resolve => {
+    if (modalResolver) closeModal(false);
+    modalResolver = resolve;
+    const card = byId('modal-root').querySelector('.modal-card');
+    card.className = `modal-card${tone ? ` ${tone}` : ''}`;
+    byId('modal-title').textContent = title;
+    byId('modal-body').textContent = body;
+    byId('modal-actions').innerHTML = actions.map((action, index) => {
+      const classes = action.primary ? '' : 'secondary';
+      return `<button type="button" class="${classes}" data-modal-action="${index}">${escapeHTML(action.label)}</button>`;
+    }).join('');
+    byId('modal-actions').onclick = event => {
+      const button = event.target.closest('[data-modal-action]');
+      if (!button) return;
+      const action = actions[Number(button.dataset.modalAction)];
+      if (action?.onClick) action.onClick();
+      closeModal(action?.value ?? true);
+    };
+    byId('modal-root').classList.remove('hidden');
+  });
+}
+
+function showConfirm({title, body, confirmLabel = 'Confirm', tone = ''}) {
+  return showModal({
+    title,
+    body,
+    tone,
+    actions: [
+      {label: 'Cancel', value: false},
+      {label: confirmLabel, primary: true, value: true},
+    ],
+  });
+}
+
+function showSuccess(title, body) {
+  return showModal({title, body, tone: 'success'});
+}
+
+function showWarning(title, body) {
+  return showModal({title, body, tone: 'warning'});
+}
+
+function showError(title, body) {
+  return showModal({title, body, tone: 'danger'});
+}
+
+byId('modal-root').addEventListener('click', event => {
+  if (event.target.matches('[data-modal-dismiss]')) closeModal(false);
+});
+byId('theme-toggle').addEventListener('click', () => {
+  applyTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
+});
+initTheme();
+initCollapsiblePanels();
+
+function rememberBasketName(value) {
+  const trimmed = String(value ?? '').trim();
+  if (trimmed) localStorage.setItem(BASKET_NAME_KEY, trimmed);
+}
+
+function restoreBasketName() {
+  const field = byId('basket-name');
+  if (!field) return;
+  const saved = localStorage.getItem(BASKET_NAME_KEY);
+  if (saved && !field.value) field.value = saved;
+  field.addEventListener('input', () => rememberBasketName(field.value));
+}
+
+restoreBasketName();
 
 function requireExecutionMetadata(instrument) {
   if (!Number.isInteger(instrument.instrument_token) || instrument.instrument_token <= 0) {
@@ -39,6 +169,82 @@ async function api(path, options = {}) {
     throw error;
   }
   return payload;
+}
+
+async function apiWithRetry(path, options = {}, attempts = 4) {
+  let lastError = null;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      return await api(path, options);
+    } catch (error) {
+      lastError = error;
+      if (attempt === attempts - 1) break;
+      await new Promise(resolve => setTimeout(resolve, 400 * (attempt + 1)));
+    }
+  }
+  throw lastError;
+}
+
+function watchlistStorageKey(instrument) {
+  return `${instrument.exchange}:${instrument.tradingsymbol}`;
+}
+
+function loadWatchlist() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(WATCHLIST_KEY) || '[]');
+    return Array.isArray(saved) ? saved.filter(item => item?.exchange && item?.tradingsymbol) : [];
+  } catch (_error) {
+    return [];
+  }
+}
+
+function saveWatchlist(items) {
+  localStorage.setItem(WATCHLIST_KEY, JSON.stringify(items));
+}
+
+function addToWatchlist(instrument) {
+  const items = loadWatchlist();
+  const key = watchlistStorageKey(instrument);
+  if (items.some(item => watchlistStorageKey(item) === key)) return false;
+  items.push(instrument);
+  saveWatchlist(items);
+  renderWatchlist();
+  return true;
+}
+
+function removeFromWatchlist(key) {
+  const items = loadWatchlist().filter(item => watchlistStorageKey(item) !== key);
+  saveWatchlist(items);
+  if (activeWatchlistKey === key) activeWatchlistKey = '';
+  renderWatchlist();
+}
+
+function renderWatchlist() {
+  const items = loadWatchlist();
+  const container = byId('watchlist-items');
+  byId('watchlist-count').textContent = `${items.length} contract${items.length === 1 ? '' : 's'}`;
+  if (!items.length) {
+    container.innerHTML = '<p class="empty watchlist-empty">Search above to add contracts. Click a saved contract to load it in the order ticket.</p>';
+    return;
+  }
+  container.innerHTML = items.map(instrument => {
+    const key = watchlistStorageKey(instrument);
+    const active = key === activeWatchlistKey ? ' active' : '';
+    return `<button type="button" class="watchlist-chip${active}" data-watchlist-select="${escapeHTML(key)}"><strong>${escapeHTML(instrument.exchange)}:${escapeHTML(instrument.tradingsymbol)}</strong><span>${escapeHTML(instrumentDescription(instrument))}</span><span class="watchlist-remove danger-button small" data-watchlist-remove="${escapeHTML(key)}" role="button" aria-label="Remove ${escapeHTML(instrument.tradingsymbol)}">×</span></button>`;
+  }).join('');
+}
+
+function applyInstrumentToOrderTicket(instrument) {
+  if (!instrument) return;
+  const exchangeField = byId('order-exchange');
+  if (exchangeField.value !== instrument.exchange) {
+    exchangeField.value = instrument.exchange;
+    orderPicker.clear();
+  }
+  orderPicker.select(instrument);
+  activeWatchlistKey = watchlistStorageKey(instrument);
+  renderWatchlist();
+  byId('order-form').scrollIntoView({behavior: 'smooth', block: 'nearest'});
 }
 
 function instrumentDescription(instrument) {
@@ -79,8 +285,10 @@ class InstrumentPicker {
 
   handleInput() {
     this.selected = null;
-    this.summary.textContent = '';
-    this.summary.className = 'selected-instrument';
+    if (this.summary) {
+      this.summary.textContent = '';
+      this.summary.className = 'selected-instrument';
+    }
     this.onSelect(null);
     clearTimeout(this.timer);
     if (this.controller) this.controller.abort();
@@ -117,8 +325,10 @@ class InstrumentPicker {
     if (!instrument) return;
     this.selected = instrument;
     this.input.value = instrument.tradingsymbol;
-    this.summary.textContent = instrumentDescription(instrument);
-    this.summary.className = 'selected-instrument visible';
+    if (this.summary) {
+      this.summary.textContent = instrumentDescription(instrument);
+      this.summary.className = 'selected-instrument visible';
+    }
     this.close();
     this.onSelect(instrument);
   }
@@ -129,8 +339,10 @@ class InstrumentPicker {
     if (this.controller) this.controller.abort();
     this.selected = null;
     this.input.value = '';
-    this.summary.textContent = '';
-    this.summary.className = 'selected-instrument';
+    if (this.summary) {
+      this.summary.textContent = '';
+      this.summary.className = 'selected-instrument';
+    }
     this.close();
     this.onSelect(null);
   }
@@ -150,15 +362,52 @@ function renderDashboard(state) {
   renderStatus(state.status);
   renderPositions(state.positions);
   renderOrders(state.orders);
+  maybeWarnLoss(state.status);
+}
+
+function maybeWarnLoss(status) {
+  const hasLiveMTM = Number.isFinite(status.live_mtm_paise);
+  const displayedMTM = hasLiveMTM ? status.live_mtm_paise : status.mtm_paise;
+  if (!Number.isFinite(displayedMTM) || displayedMTM > -LOSS_WARNING_PAISE || displayedMTM <= -LOCK_THRESHOLD_PAISE) return;
+  if (sessionStorage.getItem(LOSS_WARNING_KEY) === '1') return;
+  sessionStorage.setItem(LOSS_WARNING_KEY, '1');
+  showWarning(
+    'Loss approaching lock threshold',
+    `F&O MTM is ${money(displayedMTM)}. Trading locks automatically at ${money(-LOCK_THRESHOLD_PAISE)}. Review open risk before placing new orders.`,
+  );
 }
 
 async function refreshDashboard() {
-  renderDashboard(await api('/api/dashboard'));
+  renderDashboard(await apiWithRetry('/api/dashboard'));
 }
 
 async function refreshAudit() {
-  const audit = await api('/api/audit');
+  const audit = await apiWithRetry('/api/audit');
   renderAudit(audit.events);
+}
+
+function renderKiteStatus(status, known = kiteStatusKnown) {
+  const kiteConnect = byId('kite-connect');
+  kiteConnect.classList.remove('connected', 'actionable');
+  kiteConnect.removeAttribute('aria-disabled');
+  if (!known) {
+    kiteConnect.textContent = 'Checking Kite session…';
+    kiteConnect.href = KITE_LOGIN_PATH;
+    kiteConnect.setAttribute('aria-disabled', 'true');
+    kiteConnect.classList.add('connected');
+    return;
+  }
+  if (status.authenticated) {
+    const runtime = status.runtime_status === 'READY' ? 'session active' : status.runtime_status.replaceAll('_', ' ').toLowerCase();
+    kiteConnect.textContent = `Kite connected · ${runtime}`;
+    kiteConnect.removeAttribute('href');
+    kiteConnect.classList.add('connected');
+    kiteConnect.setAttribute('aria-disabled', 'true');
+    return;
+  }
+  kiteConnect.textContent = 'Connect Kite';
+  kiteConnect.href = KITE_LOGIN_PATH;
+  kiteConnect.classList.add('actionable');
 }
 
 function renderStatus(status) {
@@ -166,7 +415,7 @@ function renderStatus(status) {
   const displayedMTM = hasLiveMTM ? status.live_mtm_paise : status.mtm_paise;
   byId('mtm-label').textContent = hasLiveMTM ? 'Live F&O daily MTM · risk value' : 'F&O MTM · delayed REST snapshot';
   byId('mtm').textContent = money(displayedMTM);
-  byId('mtm').className = displayedMTM <= -3000000 ? 'negative' : displayedMTM < 0 ? 'warning' : 'positive';
+  byId('mtm').className = displayedMTM <= -LOCK_THRESHOLD_PAISE ? 'negative' : displayedMTM <= -LOSS_WARNING_PAISE ? 'warning' : displayedMTM < 0 ? 'warning' : 'positive';
   byId('confirmed-mtm').textContent = money(status.mtm_paise);
   byId('market-feed').textContent = status.market_data_status === 'LIVE' && status.market_data_at
     ? `Live · ${new Date(status.market_data_at).toLocaleTimeString('en-IN')}`
@@ -184,31 +433,78 @@ function renderStatus(status) {
   alert.className = `alert ${status.trading_status === 'LOCKED' ? 'danger' : status.runtime_status === 'READY' ? 'safe' : 'warning'}`;
   byId('submit-order').disabled = status.trading_status === 'LOCKED' || status.runtime_status !== 'READY';
   byId('submit-basket').disabled = status.trading_status === 'LOCKED' || status.runtime_status !== 'READY';
-  const kiteConnect = byId('kite-connect');
-  if (status.authenticated) {
-    kiteConnect.textContent = 'Kite connected';
-    kiteConnect.removeAttribute('href');
-    kiteConnect.setAttribute('aria-disabled', 'true');
-  } else {
-    kiteConnect.textContent = 'Connect Kite';
-    kiteConnect.href = kiteConnect.dataset.loginHref;
-    kiteConnect.removeAttribute('aria-disabled');
-  }
+  kiteStatusKnown = true;
+  renderKiteStatus(status);
+}
+
+function syncPositionSelectionUI() {
+  const selectable = latestPositions.filter(position => position.quantity);
+  const exitSelected = byId('exit-selected');
+  exitSelected.hidden = selectedPositions.size === 0;
+  exitSelected.textContent = selectedPositions.size > 1
+    ? `Exit ${selectedPositions.size} selected`
+    : 'Exit selected';
+  const selectAll = byId('select-all-positions');
+  selectAll.disabled = selectable.length === 0;
+  selectAll.checked = selectable.length > 0 && selectable.every(position => selectedPositions.has(positionKey(position.instrument_token, position.product)));
+  selectAll.indeterminate = selectedPositions.size > 0 && !selectAll.checked;
 }
 
 function renderPositions(rows = []) {
-  byId('positions').innerHTML = rows.length ? rows.map(position => {
-    const action = !position.quantity ? '' : `<button class="danger-button small" data-exit="${position.instrument_token}" data-exit-product="${escapeHTML(position.product)}">Exit</button>`;
-    return `<tr><td><strong>${escapeHTML(position.exchange)}:${escapeHTML(position.tradingsymbol)}</strong></td><td>${escapeHTML(position.product)}</td><td>${position.quantity}</td><td>${rupees(position.last_price)}</td><td class="${position.m2m < 0 ? 'negative' : 'positive'}">${rupees(position.m2m)}</td><td>${action}</td></tr>`;
-  }).join('') : '<tr><td colspan="6" class="empty">No F&amp;O positions</td></tr>';
+  latestPositions = rows.filter(position => position.quantity);
+  const validKeys = new Set(latestPositions.map(position => positionKey(position.instrument_token, position.product)));
+  for (const key of [...selectedPositions]) {
+    if (!validKeys.has(key)) selectedPositions.delete(key);
+  }
+  byId('positions').innerHTML = latestPositions.length ? latestPositions.map(position => {
+    const key = positionKey(position.instrument_token, position.product);
+    const selectable = Boolean(position.quantity);
+    const checked = selectedPositions.has(key) ? 'checked' : '';
+    const checkbox = selectable
+      ? `<input type="checkbox" data-position-select value="${escapeHTML(key)}" ${checked} aria-label="Select ${escapeHTML(position.tradingsymbol)}">`
+      : '';
+    const action = !selectable ? '' : `<button type="button" class="danger-button small" data-exit="${position.instrument_token}" data-exit-product="${escapeHTML(position.product)}" data-exit-symbol="${escapeHTML(position.exchange)}:${escapeHTML(position.tradingsymbol)}" data-exit-qty="${Math.abs(position.quantity)}">Exit</button>`;
+    return `<tr><td class="select-col">${checkbox}</td><td><strong>${escapeHTML(position.exchange)}:${escapeHTML(position.tradingsymbol)}</strong></td><td>${escapeHTML(position.product)}</td><td>${position.quantity}</td><td>${rupees(position.last_price)}</td><td class="${position.m2m < 0 ? 'negative' : 'positive'}">${rupees(position.m2m)}</td><td>${action}</td></tr>`;
+  }).join('') : '<tr><td colspan="7" class="empty">No F&amp;O positions</td></tr>';
+  syncPositionSelectionUI();
+}
+
+function detectOrderFillChanges(rows = []) {
+  for (const order of rows) {
+    const previous = orderSnapshots.get(order.order_id);
+    const filled = Number(order.filled_quantity) || 0;
+    const quantity = Number(order.quantity) || 0;
+    const pending = Number(order.pending_quantity) || 0;
+    if (previous) {
+      const newlyFilled = filled - previous.filled;
+      if (newlyFilled > 0 && pending > 0) {
+        showWarning(
+          'Partial fill in progress',
+          `${order.exchange}:${order.tradingsymbol} filled ${newlyFilled} of ${quantity}. ${pending} quantity is still pending at Kite.`,
+        );
+      } else if (
+        previous.status !== 'COMPLETE'
+        && order.status === 'COMPLETE'
+        && filled > 0
+        && filled < quantity
+      ) {
+        showWarning(
+          'Order partially filled',
+          `${order.exchange}:${order.tradingsymbol} completed with ${filled} of ${quantity} filled. Review the order book before assuming the full size executed.`,
+        );
+      }
+    }
+    orderSnapshots.set(order.order_id, {filled, quantity, status: order.status});
+  }
 }
 
 function renderOrders(rows = []) {
-	const terminal = new Set(['COMPLETE', 'CANCELLED', 'REJECTED']);
-	byId('orders').innerHTML = rows.length ? rows.map(order => {
-		const cancellable = !terminal.has(order.status);
-		return `<tr><td class="mono">${escapeHTML(order.order_id)}</td><td>${escapeHTML(order.exchange)}:${escapeHTML(order.tradingsymbol)}</td><td>${escapeHTML(order.transaction_type)}</td><td>${escapeHTML(order.order_type)}</td><td>${order.quantity} / ${order.pending_quantity}</td><td>${escapeHTML(order.status)}</td><td>${cancellable ? `<button class="secondary small" data-modify="${escapeHTML(order.order_id)}">Modify</button> <button class="danger-button small" data-cancel="${escapeHTML(order.order_id)}">Cancel</button>` : ''}</td></tr>`;
-	}).join('') : '<tr><td colspan="7" class="empty">No orders today</td></tr>';
+  detectOrderFillChanges(rows);
+  const terminal = new Set(['COMPLETE', 'CANCELLED', 'REJECTED']);
+  byId('orders').innerHTML = rows.length ? rows.map(order => {
+    const cancellable = !terminal.has(order.status);
+    return `<tr><td class="mono">${escapeHTML(order.order_id)}</td><td>${escapeHTML(order.exchange)}:${escapeHTML(order.tradingsymbol)}</td><td>${escapeHTML(order.transaction_type)}</td><td>${escapeHTML(order.order_type)}</td><td>${order.quantity} / ${order.pending_quantity}</td><td>${escapeHTML(order.status)}</td><td>${cancellable ? `<button type="button" class="secondary small" data-modify="${escapeHTML(order.order_id)}">Modify</button> <button type="button" class="danger-button small" data-cancel="${escapeHTML(order.order_id)}">Cancel</button>` : ''}</td></tr>`;
+  }).join('') : '<tr><td colspan="7" class="empty">No orders today</td></tr>';
 }
 
 function renderAudit(rows = []) {
@@ -235,7 +531,37 @@ const orderPicker = new InstrumentPicker(byId('order-instrument'), () => byId('o
 });
 
 orderLots.addEventListener('input', () => orderPicker.onSelect(orderPicker.selected));
-byId('order-exchange').addEventListener('change', () => orderPicker.clear());
+byId('order-exchange').addEventListener('change', () => {
+  activeWatchlistKey = '';
+  renderWatchlist();
+  orderPicker.clear();
+});
+
+const watchlistPicker = new InstrumentPicker(byId('watchlist-picker'), () => byId('watchlist-exchange').value, {
+  onSelect: instrument => {
+    if (!instrument) return;
+    addToWatchlist(instrument);
+    applyInstrumentToOrderTicket(instrument);
+    watchlistPicker.input.value = '';
+    watchlistPicker.selected = null;
+    watchlistPicker.close();
+  },
+});
+byId('watchlist-exchange').addEventListener('change', () => watchlistPicker.clear());
+byId('watchlist-items').addEventListener('click', event => {
+  const remove = event.target.closest('[data-watchlist-remove]');
+  if (remove) {
+    event.stopPropagation();
+    removeFromWatchlist(remove.dataset.watchlistRemove);
+    return;
+  }
+  const select = event.target.closest('[data-watchlist-select]');
+  if (!select) return;
+  const key = select.dataset.watchlistSelect;
+  const instrument = loadWatchlist().find(item => watchlistStorageKey(item) === key);
+  if (instrument) applyInstrumentToOrderTicket(instrument);
+});
+renderWatchlist();
 
 function syncOrderType() {
   const type = byId('order-type').value;
@@ -271,9 +597,14 @@ orderForm.addEventListener('submit', async event => {
     const result = await api('/api/orders', {method: 'POST', body: JSON.stringify(body)});
     output.textContent = `${result.decision.message} Order: ${result.order_id}`;
     output.className = 'success';
+    await showSuccess(
+      'Order submitted',
+      `${result.decision.message}\nOrder ID: ${result.order_id}\n${instrument.exchange}:${instrument.tradingsymbol} · ${body.transaction_type} · ${body.quantity} qty · ${body.product}`,
+    );
   } catch (error) {
     output.textContent = error.payload?.decision?.message || error.message;
     output.className = 'error';
+    await showError('Order rejected', error.payload?.decision?.message || error.message);
   }
   await Promise.allSettled([refreshDashboard(), refreshAudit()]);
 });
@@ -340,6 +671,9 @@ byId('basket-form').addEventListener('submit', async event => {
   output.textContent = 'Validating complete portfolio…';
   output.className = '';
   try {
+    const basketName = String(form.get('basket_name') ?? byId('basket-name').value ?? '').trim();
+    if (!basketName) throw new Error('Enter a basket name before deploying.');
+    rememberBasketName(basketName);
     const legs = [...byId('basket-legs').children].map(row => {
       const selected = basketPickers.get(row).selected;
       if (!selected) return null;
@@ -356,15 +690,104 @@ byId('basket-form').addEventListener('submit', async event => {
       };
     }).filter(Boolean);
     if (legs.length < 2) throw new Error('Select at least two option contracts. Blank rows are ignored.');
-    const data = await api('/api/baskets', {method: 'POST', body: JSON.stringify({idempotency_key: randomID(), name: form.get('name'), order_type: orderType, legs})});
+    const data = await api('/api/baskets', {method: 'POST', body: JSON.stringify({idempotency_key: randomID(), name: basketName, order_type: orderType, legs})});
     const loss = data.result.max_loss_known ? ` Maximum planned loss: ${money(data.result.max_loss_paise)}.` : ' Maximum planned loss is unavailable for MARKET execution because fill prices are not known in advance.';
     output.textContent = data.result.message + loss;
     output.className = 'success';
+    await showSuccess('Basket submitted', data.result.message + loss);
   } catch (error) {
     output.textContent = error.payload?.result?.message || error.message;
     output.className = 'error';
+    await showError('Basket rejected', error.payload?.result?.message || error.message);
   }
   await Promise.allSettled([refreshDashboard(), refreshAudit()]);
+});
+
+async function exitPosition({token, product, symbol, quantity}) {
+  const confirmed = await showConfirm({
+    title: 'Exit position',
+    body: `Exit ${symbol} (${product}) at market with Kite automatic protection?\nQuantity to exit: ${quantity}`,
+    confirmLabel: 'Exit position',
+    tone: 'warning',
+  });
+  if (!confirmed) return;
+  try {
+    const result = await api(`/api/positions/${encodeURIComponent(token)}/exit`, {
+      method: 'POST',
+      body: JSON.stringify({product, quantity}),
+    });
+    await showSuccess('Exit submitted', `${symbol} exit order submitted.\nOrder ID: ${result.order_id || 'pending reconciliation'}`);
+  } catch (error) {
+    await showError('Exit failed', error.payload?.error?.message || error.message);
+  }
+  await Promise.allSettled([refreshDashboard(), refreshAudit()]);
+}
+
+async function exitSelectedPositions() {
+  const targets = latestPositions.filter(position => {
+    const key = positionKey(position.instrument_token, position.product);
+    return position.quantity && selectedPositions.has(key);
+  });
+  if (!targets.length) return;
+  const confirmed = await showConfirm({
+    title: 'Exit selected positions',
+    body: `Exit ${targets.length} selected F&O position${targets.length === 1 ? '' : 's'} at market with Kite automatic protection?`,
+    confirmLabel: `Exit ${targets.length} position${targets.length === 1 ? '' : 's'}`,
+    tone: 'warning',
+  });
+  if (!confirmed) return;
+  const failures = [];
+  const successes = [];
+  for (const position of targets) {
+    try {
+      const result = await api(`/api/positions/${encodeURIComponent(position.instrument_token)}/exit`, {
+        method: 'POST',
+        body: JSON.stringify({product: position.product}),
+      });
+      successes.push(`${position.exchange}:${position.tradingsymbol} (${result.order_id || 'submitted'})`);
+      selectedPositions.delete(positionKey(position.instrument_token, position.product));
+    } catch (error) {
+      failures.push(`${position.exchange}:${position.tradingsymbol}: ${error.payload?.error?.message || error.message}`);
+    }
+  }
+  if (successes.length) {
+    await showSuccess(
+      successes.length === 1 ? 'Exit submitted' : 'Exits submitted',
+      successes.join('\n'),
+    );
+  }
+  if (failures.length) {
+    await showError(
+      failures.length === 1 ? 'Exit failed' : 'Some exits failed',
+      failures.join('\n'),
+    );
+  }
+  await Promise.allSettled([refreshDashboard(), refreshAudit()]);
+}
+
+byId('positions').addEventListener('change', event => {
+  if (event.target.matches('[data-position-select]')) {
+    const key = event.target.value;
+    if (event.target.checked) selectedPositions.add(key);
+    else selectedPositions.delete(key);
+    syncPositionSelectionUI();
+    return;
+  }
+});
+
+byId('select-all-positions').addEventListener('change', event => {
+  const selectable = latestPositions.filter(position => position.quantity);
+  selectedPositions.clear();
+  if (event.target.checked) {
+    for (const position of selectable) {
+      selectedPositions.add(positionKey(position.instrument_token, position.product));
+    }
+  }
+  renderPositions(latestPositions);
+});
+
+byId('exit-selected').addEventListener('click', () => {
+  exitSelectedPositions();
 });
 
 document.addEventListener('click', async event => {
@@ -372,35 +795,65 @@ document.addEventListener('click', async event => {
     picker.querySelector('.instrument-results').innerHTML = '';
     picker.querySelector('input[type="search"]').setAttribute('aria-expanded', 'false');
   });
-  const cancel = event.target.dataset.cancel;
-  if (cancel && confirm('Cancel this pending order?')) {
-    await api(`/api/orders/${encodeURIComponent(cancel)}/cancel`, {method: 'POST', body: '{}'});
+  const cancelButton = event.target.closest('[data-cancel]');
+  if (cancelButton) {
+    const cancel = cancelButton.dataset.cancel;
+    if (!(await showConfirm({
+      title: 'Cancel order',
+      body: `Cancel pending order ${cancel}?`,
+      confirmLabel: 'Cancel order',
+      tone: 'warning',
+    }))) return;
+    try {
+      await api(`/api/orders/${encodeURIComponent(cancel)}/cancel`, {method: 'POST', body: '{}'});
+      await showSuccess('Order cancelled', `Cancellation submitted for order ${cancel}.`);
+    } catch (error) {
+      await showError('Cancel failed', error.payload?.error?.message || error.message);
+    }
     await Promise.allSettled([refreshDashboard(), refreshAudit()]);
     return;
   }
-  const token = event.target.dataset.exit;
-  if (token && confirm('Exit this entire F&O position at market with automatic protection?')) {
-    await api(`/api/positions/${token}/exit`, {method: 'POST', body: JSON.stringify({product: event.target.dataset.exitProduct})});
-    await Promise.allSettled([refreshDashboard(), refreshAudit()]);
+  const exitButton = event.target.closest('[data-exit]');
+  if (exitButton) {
+    const fullQuantity = Number(exitButton.dataset.exitQty);
+    const input = prompt(`Quantity to exit (max ${fullQuantity}):`, String(fullQuantity));
+    if (input === null) return;
+    const quantity = Number(input);
+    if (!Number.isInteger(quantity) || quantity <= 0 || quantity > fullQuantity) {
+      await showError('Invalid quantity', `Enter a whole number between 1 and ${fullQuantity}.`);
+      return;
+    }
+    await exitPosition({
+      token: exitButton.dataset.exit,
+      product: exitButton.dataset.exitProduct,
+      symbol: exitButton.dataset.exitSymbol,
+      quantity,
+    });
     return;
   }
-  const modify = event.target.dataset.modify;
-  if (modify) {
+  const modifyButton = event.target.closest('[data-modify]');
+  if (modifyButton) {
+    const modify = modifyButton.dataset.modify;
     const quantity = Number(prompt('New total quantity:'));
     if (!quantity) return;
     const orderType = (prompt('Order type (MARKET, LIMIT, SL, SL-M):', 'LIMIT') || '').toUpperCase();
     if (!orderType) return;
     const price = Number(prompt('Price (0 when unused):', '0'));
     const triggerPrice = Number(prompt('Trigger price (0 when unused):', '0'));
-    await api(`/api/orders/${encodeURIComponent(modify)}/modify`, {method: 'POST', body: JSON.stringify({idempotency_key: randomID(), quantity, order_type: orderType, validity: 'DAY', price, trigger_price: triggerPrice})});
+    try {
+      await api(`/api/orders/${encodeURIComponent(modify)}/modify`, {method: 'POST', body: JSON.stringify({idempotency_key: randomID(), quantity, order_type: orderType, validity: 'DAY', price, trigger_price: triggerPrice})});
+      await showSuccess('Order modified', `Modification submitted for order ${modify}.`);
+    } catch (error) {
+      await showError('Modify failed', error.payload?.error?.message || error.message);
+    }
     await Promise.allSettled([refreshDashboard(), refreshAudit()]);
-    return;
   }
 });
 
 const events = new EventSource('/api/events');
 events.addEventListener('open', () => {
   byId('live-connection').textContent = 'Live';
+  refreshDashboard().catch(() => {});
 });
 events.addEventListener('state', event => {
   try {
@@ -416,4 +869,5 @@ events.addEventListener('error', () => {
 Promise.all([refreshDashboard(), refreshAudit()]).catch(error => {
   byId('alert').textContent = error.message;
   byId('alert').className = 'alert danger';
+  renderKiteStatus({authenticated: false, runtime_status: 'AUTH_REQUIRED'}, false);
 });

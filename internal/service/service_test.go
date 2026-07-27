@@ -419,7 +419,7 @@ func TestExplicitPositionExitMatchesInstrumentAndProduct(t *testing.T) {
 	if err := app.Authenticate(context.Background(), "request"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := app.ExitPosition(context.Background(), 1, "NRML"); err != nil {
+	if _, err := app.ExitPosition(context.Background(), 1, "NRML", 0); err != nil {
 		t.Fatal(err)
 	}
 	if len(broker.exitedProducts) != 1 || broker.exitedProducts[0] != "NRML" || broker.positions[0].Quantity != 50 || broker.positions[1].Quantity != 0 {
@@ -433,7 +433,7 @@ func TestExplicitPositionExitRequiresExactInstrumentTokenMetadata(t *testing.T) 
 	if err := app.Authenticate(context.Background(), "request"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := app.ExitPosition(context.Background(), 999, "MIS"); err == nil || broker.exitCalls != 0 {
+	if _, err := app.ExitPosition(context.Background(), 999, "MIS", 0); err == nil || broker.exitCalls != 0 {
 		t.Fatalf("exitCalls=%d error=%v", broker.exitCalls, err)
 	}
 }
@@ -445,7 +445,7 @@ func TestPartiallyAcceptedExitFailsClosedUntilReconciliation(t *testing.T) {
 	if err := app.Authenticate(context.Background(), "request"); err != nil {
 		t.Fatal(err)
 	}
-	orderID, err := app.ExitPosition(context.Background(), 1, "MIS")
+	orderID, err := app.ExitPosition(context.Background(), 1, "MIS", 0)
 	if err == nil || orderID == "" || app.Snapshot().RuntimeStatus != domain.RuntimeDegraded {
 		t.Fatalf("orderID=%q snapshot=%#v error=%v", orderID, app.Snapshot(), err)
 	}
@@ -458,8 +458,8 @@ func TestRepeatedExplicitExitDoesNotDuplicateUncertainSubmission(t *testing.T) {
 	if err := app.Authenticate(context.Background(), "request"); err != nil {
 		t.Fatal(err)
 	}
-	firstID, firstErr := app.ExitPosition(context.Background(), 1, "MIS")
-	secondID, secondErr := app.ExitPosition(context.Background(), 1, "MIS")
+	firstID, firstErr := app.ExitPosition(context.Background(), 1, "MIS", 0)
+	secondID, secondErr := app.ExitPosition(context.Background(), 1, "MIS", 0)
 	if firstErr != nil || firstID == "" || secondErr == nil || secondID != firstID || broker.exitCalls != 1 {
 		t.Fatalf("first=(%q,%v) second=(%q,%v) calls=%d", firstID, firstErr, secondID, secondErr, broker.exitCalls)
 	}
@@ -626,6 +626,32 @@ func TestUncertainExitIntentSurvivesServiceRestart(t *testing.T) {
 	}
 	if broker.exitCalls != 1 {
 		t.Fatalf("exit calls=%d after restart", broker.exitCalls)
+	}
+}
+
+func TestStalePendingExitIntentClearsAndAllowsRetry(t *testing.T) {
+	app, broker, store := newTestService(t, 0)
+	key := positionKeyFor("NFO", "NIFTY26JULFUT", "NRML")
+	app.forcedExits[key] = pendingExitPrefix + "abc"
+	app.forcedExitAt[key] = app.now()
+	if err := store.PutLiquidationIntent(context.Background(), domain.LiquidationIntent{PositionKey: key, OrderID: pendingExitPrefix + "abc", CreatedAt: app.now()}); err != nil {
+		t.Fatal(err)
+	}
+	broker.positions = []domain.Position{{Exchange: "NFO", TradingSymbol: "NIFTY26JULFUT", InstrumentToken: 1, Product: "NRML", Quantity: -50}}
+	if err := app.Authenticate(context.Background(), "request"); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.PollOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := app.forcedExits[key]; ok {
+		t.Fatal("stale pending exit intent was not cleared")
+	}
+	if _, err := app.ExitPosition(context.Background(), 1, "NRML", 0); err != nil {
+		t.Fatalf("exit after reconciliation: %v", err)
+	}
+	if broker.exitCalls != 1 {
+		t.Fatalf("exit calls=%d", broker.exitCalls)
 	}
 }
 
@@ -879,6 +905,15 @@ func newTestService(t *testing.T, mtm float64) (*Service, *fakeBroker, *fakeStor
 	return app, broker, store
 }
 
+func allPositionsFlat(positions []domain.Position) bool {
+	for _, position := range positions {
+		if position.Quantity != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func validRequest(symbol, side string, quantity int) domain.OrderRequest {
 	return domain.OrderRequest{IdempotencyKey: "order-key-123", Variety: "regular", Exchange: "NFO", TradingSymbol: symbol, Product: "MIS", OrderType: "MARKET", TransactionType: side, Validity: "DAY", Quantity: quantity}
 }
@@ -901,8 +936,9 @@ type fakeBroker struct {
 	instruments    []domain.Instrument
 	placeCalls     int
 	cancelCalls    int
-	exitCalls      int
-	exitedProducts []string
+	exitCalls        int
+	exitedProducts   []string
+	exitedQuantities []int
 	exitErrAfterID bool
 	modifyCalls    int
 	failPositions  bool
@@ -1017,20 +1053,35 @@ func (f *fakeBroker) Cancel(_ context.Context, _ string, orderID string) error {
 	}
 	return nil
 }
-func (f *fakeBroker) ExitPosition(_ context.Context, position domain.Position) (string, error) {
+func (f *fakeBroker) ExitPosition(_ context.Context, position domain.Position, quantity int) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.exitCalls++
 	f.exitedProducts = append(f.exitedProducts, position.Product)
+	f.exitedQuantities = append(f.exitedQuantities, quantity)
 	if f.exitInvisible {
 		return "exit-invisible", nil
 	}
 	for index := range f.positions {
 		if f.positions[index].InstrumentToken == position.InstrumentToken && f.positions[index].Product == position.Product {
-			f.positions[index].Quantity = 0
+			remaining := f.positions[index].Quantity
+			if remaining < 0 {
+				remaining += quantity
+				if remaining > 0 {
+					remaining = 0
+				}
+			} else {
+				remaining -= quantity
+				if remaining < 0 {
+					remaining = 0
+				}
+			}
+			f.positions[index].Quantity = remaining
 		}
 	}
-	f.mtm = 0
+	if allPositionsFlat(f.positions) {
+		f.mtm = 0
+	}
 	f.orders = append(f.orders, domain.Order{OrderID: "exit-1", Variety: "regular", Status: "COMPLETE", Exchange: position.Exchange, TradingSymbol: position.TradingSymbol, Product: position.Product, Tag: forcedExitTag})
 	if f.exitErrAfterID {
 		return "exit-1", errors.New("one autoslice child failed")

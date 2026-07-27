@@ -22,7 +22,7 @@
 - Keep HTTP handlers thin. Domain rules belong in the risk/trading services; Kite-specific types belong behind the broker adapter.
 
 ## Sources and changes
-
+- <<<< IMportant and MUST FOLLOW RULE : DONT DO GUESS WORKS try to refer docs,sdk code whenever in need/confused.  while fetching kite docs just append to url /index.md to get it in MARKDOWN format. else it will return the raw HTML even if we do content negotiation. >>>>
 - Use the Markdown Kite Connect documentation under `https://kite.trade/docs/connect/v3/` and official Go package docs as sources of truth.
 - Preserve the broker abstraction and deterministic fake-broker test path. The running adapter is production-only until Zerodha launches generally available sandbox users; do not reintroduce a documentation-only sandbox route.
 - Never commit credentials or real account/order data. Live-order tests must always be opt-in and must never run in ordinary test commands.
@@ -34,3 +34,6 @@
 - Run `gofmt` on changed Go files.
 - Run `go test ./...`, `go test -race ./...`, and `go vet ./...` before handoff.
 - Keep the application bound to `127.0.0.1` unless the security model and plan are explicitly revised.
+
+User Requests
+- if a user need any changes , try to think from a product mindset and not just coding perspective , if user has feature requests, you can try to ask him some questions so that you dont get fixated on just what he is saying but you understand the reletaed things he want for it. eg (i told you to implement a feature that while exiting position give option to put quantity but you didnt gave increase  decrease buttons, thats incomplete product understanding and mindset.
