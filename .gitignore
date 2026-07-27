@@ -3,5 +3,5 @@ data/
 *.log
 .DS_Store
 coverage.out
-tradeguardian
+/tradeguardian
 .build/
